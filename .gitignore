@@ -1,0 +1,30 @@
+# Credentials and secrets
+.env
+.env.*
+*.pem
+*.key
+*.p12
+*.pfx
+*.keystore
+*.jks
+id_rsa
+id_ed25519
+*.secret
+credentials.json
+secrets.yaml
+secrets.yml
+*.keytab
+
+# PII and database dumps
+*.sql
+*.dump
+
+# Build
+build/
+*.o
+*.a
+
+# Editor
+*~
+*.swp
+.vscode/
