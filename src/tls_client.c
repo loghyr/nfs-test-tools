@@ -21,13 +21,24 @@
 #include <string.h>
 #include <unistd.h>
 #include <errno.h>
+#include <time.h>
 #include <sys/types.h>
 #include <sys/socket.h>
 #include <netdb.h>
 #include <openssl/err.h>
+#include <openssl/objects.h>
 
 /* Maximum RPC reply body we will accept during STARTTLS (before TLS) */
 #define STARTTLS_REPLY_MAX 512
+
+/* --- timing helper --- */
+
+static double now_ms(void)
+{
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (double)ts.tv_sec * 1e3 + (double)ts.tv_nsec * 1e-6;
+}
 
 /* --- internal helpers --- */
 
@@ -259,6 +270,13 @@ SSL_CTX *tls_ctx_create(const char *ca_cert, const char *cert, const char *key)
     /* Minimum TLS 1.3 per RFC 9289 S4 */
     SSL_CTX_set_min_proto_version(ctx, TLS1_3_VERSION);
 
+    /*
+     * Disable the internal session cache so sessions are not shared
+     * between callers.  The caller manages sessions explicitly via
+     * tls_connect_starttls(session_in) and tls_conn_get_session().
+     */
+    SSL_CTX_set_session_cache_mode(ctx, SSL_SESS_CACHE_OFF);
+
     if (ca_cert) {
         if (!SSL_CTX_load_verify_locations(ctx, ca_cert, NULL)) {
             fprintf(stderr, "SSL_CTX_load_verify_locations(%s) failed\n",
@@ -287,34 +305,40 @@ SSL_CTX *tls_ctx_create(const char *ca_cert, const char *cert, const char *key)
 }
 
 int tls_connect_starttls(const char *host, const char *port,
-                         SSL_CTX *ctx, struct tls_conn *conn,
+                         SSL_CTX *ctx,
+                         SSL_SESSION *session_in,
+                         struct tls_conn *conn,
+                         uint32_t xid,
+                         struct tls_timing *timing,
                          char *errbuf, size_t errsz)
 {
+    double t0, t1, t2, t3;
+
     memset(conn, 0, sizeof(*conn));
     conn->tc_fd  = -1;
     conn->tc_ctx = ctx;
 
     /* Step 1: TCP connect */
+    t0 = now_ms();
     conn->tc_fd = tcp_connect(host, port, errbuf, errsz);
     if (conn->tc_fd < 0)
         return -1;
+    t1 = now_ms();
 
-    /* Step 2: Send AUTH_TLS NULL probe */
-    uint32_t xid = (uint32_t)getpid() ^ (uint32_t)(uintptr_t)conn;
+    /* Step 2: Send AUTH_TLS NULL probe + receive reply */
     if (send_auth_tls_probe(conn->tc_fd, xid, errbuf, errsz) < 0) {
         close(conn->tc_fd);
         conn->tc_fd = -1;
         return -1;
     }
-
-    /* Step 3: Read and verify RPC_SUCCESS reply */
     if (recv_starttls_reply(conn->tc_fd, xid, errbuf, errsz) < 0) {
         close(conn->tc_fd);
         conn->tc_fd = -1;
         return -1;
     }
+    t2 = now_ms();
 
-    /* Step 4: TLS handshake */
+    /* Step 3: TLS handshake */
     conn->tc_ssl = SSL_new(ctx);
     if (!conn->tc_ssl) {
         ossl_errbuf(errbuf, errsz, "SSL_new");
@@ -322,6 +346,10 @@ int tls_connect_starttls(const char *host, const char *port,
         conn->tc_fd = -1;
         return -1;
     }
+
+    /* Optional session resumption: set before SSL_connect */
+    if (session_in)
+        SSL_set_session(conn->tc_ssl, session_in);
 
     /* ALPN: wire encoding is length-prefixed ("sunrpc" = 6 bytes) */
     static const uint8_t alpn_sunrpc[] = { 6, 's', 'u', 'n', 'r', 'p', 'c' };
@@ -352,8 +380,9 @@ int tls_connect_starttls(const char *host, const char *port,
         conn->tc_fd = -1;
         return -1;
     }
+    t3 = now_ms();
 
-    /* Step 5: Verify ALPN negotiated to "sunrpc" (RFC 9289 S4.1) */
+    /* Step 4: Verify ALPN negotiated to "sunrpc" (RFC 9289 S4.1) */
     const uint8_t *proto;
     unsigned int   proto_len;
     SSL_get0_alpn_selected(conn->tc_ssl, &proto, &proto_len);
@@ -368,14 +397,21 @@ int tls_connect_starttls(const char *host, const char *port,
         return -1;
     }
 
+    /* Record per-phase timings if requested */
+    if (timing) {
+        timing->tt_tcp_ms       = t1 - t0;
+        timing->tt_probe_ms     = t2 - t1;
+        timing->tt_handshake_ms = t3 - t2;
+    }
+
     return 0;
 }
 
-int tls_send_nfs_null(struct tls_conn *conn, char *errbuf, size_t errsz)
+int tls_send_nfs_null(struct tls_conn *conn, uint32_t xid,
+                      char *errbuf, size_t errsz)
 {
     /* Send a NULL RPC call over TLS -- AUTH_NONE, NFS prog/vers */
     uint8_t call_buf[64];
-    uint32_t xid = (uint32_t)getpid() ^ 0xbeef0000u;
     size_t call_len = rpc_build_null_call(call_buf, sizeof(call_buf), xid,
                                            NFS_PROGRAM, NFS_VERSION_4,
                                            RPC_AUTH_NONE);
@@ -447,6 +483,31 @@ int tls_send_nfs_null(struct tls_conn *conn, char *errbuf, size_t errsz)
         return -1;
     }
     return 0;
+}
+
+SSL_SESSION *tls_conn_get_session(struct tls_conn *conn)
+{
+    if (!conn->tc_ssl)
+        return NULL;
+    return SSL_get1_session(conn->tc_ssl);
+}
+
+void tls_conn_print_info(const struct tls_conn *conn)
+{
+    if (!conn->tc_ssl)
+        return;
+
+    const char *ver = SSL_get_version(conn->tc_ssl);
+    const SSL_CIPHER *ciph = SSL_get_current_cipher(conn->tc_ssl);
+    const char *ciph_name = ciph ? SSL_CIPHER_get_name(ciph) : "unknown";
+
+#if OPENSSL_VERSION_NUMBER >= 0x30000000L
+    int grp = SSL_get_negotiated_group(conn->tc_ssl);
+    const char *grp_name = (grp > 0) ? OBJ_nid2sn(grp) : "unknown";
+    printf("TLS: %s, %s, %s\n", ver, ciph_name, grp_name);
+#else
+    printf("TLS: %s, %s\n", ver, ciph_name);
+#endif
 }
 
 void tls_conn_close(struct tls_conn *conn)

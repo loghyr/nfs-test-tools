@@ -8,7 +8,7 @@ nfs_tls_test_SOURCES = \
 	tls_client.c
 
 nfs_tls_test_CFLAGS  = $(OPENSSL_CFLAGS)
-nfs_tls_test_LDADD   = $(OPENSSL_LIBS) -lm
+nfs_tls_test_LDADD   = $(OPENSSL_LIBS) -lm -lpthread
 
 if HAVE_GSSAPI
 bin_PROGRAMS += nfs_krb5_test
