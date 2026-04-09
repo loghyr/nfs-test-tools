@@ -218,10 +218,21 @@ Two GSS rounds is normal for Kerberos 5 (INIT + one CONTINUE).
 
 ## Running on a server under test
 
+For server setup instructions (server requirements, certificate
+configuration, NFSv3 vs NFSv4 compatibility), see `README.md`.
+
 ### Minimal TLS check (correctness only)
 
 ```bash
 ./src/nfs_tls_test --host SERVER --iterations 10 --tls-info
+```
+
+For NFSv3-only servers (no NFSv4 support), add `--no-null` to skip
+the post-handshake NULL RPC (which uses NFS_VERSION_4 in its header)
+and test only the STARTTLS exchange and TLS handshake:
+
+```bash
+./src/nfs_tls_test --host SERVER --iterations 10 --tls-info --no-null
 ```
 
 ### Stress test (concurrent, with session reuse and histogram)
