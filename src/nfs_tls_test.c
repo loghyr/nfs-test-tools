@@ -658,7 +658,10 @@ int main(int argc, char **argv)
         .start_sec    = start_sec,
     };
     if (o.o_progress > 0) {
-        pthread_create(&progress_tid, NULL, progress_thread, &ps);
+        if (pthread_create(&progress_tid, NULL, progress_thread, &ps) != 0) {
+            fprintf(stderr, "pthread_create progress thread failed\n");
+            progress_tid = 0;
+        }
     }
 
     /* Wait for duration, then signal workers to stop */

@@ -386,7 +386,7 @@ int tls_connect_starttls(const char *host, const char *port,
     const uint8_t *proto;
     unsigned int   proto_len;
     SSL_get0_alpn_selected(conn->tc_ssl, &proto, &proto_len);
-    if (proto_len != 6 || memcmp(proto, "sunrpc", 6) != 0) {
+    if (!proto || proto_len != 6 || memcmp(proto, "sunrpc", 6) != 0) {
         snprintf(errbuf, errsz,
                  "TLS ALPN mismatch: server negotiated '%.*s', want 'sunrpc'",
                  (int)proto_len, proto ? (const char *)proto : "");
