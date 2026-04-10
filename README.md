@@ -262,6 +262,34 @@ Emits a single JSON object instead of the human-readable report.
 The shape is documented in `--help` and is intended to be parsed
 by downstream CI tooling without scraping the ASCII format.
 
+#### Symbolic exit codes and error reference
+
+When a run fails, `nfs_tls_test` prints one or more `[ERROR SYMBOL]`
+blocks pointing at the matching section of `TROUBLESHOOTING.md`:
+
+```
+Most likely causes (see TROUBLESHOOTING.md for details):
+[ERROR HANDSHAKE_FAILED]  (10 handshake failures)
+    TLS handshake failed for an unspecified reason
+    Fix: Run with --keylog and decrypt the capture in Wireshark
+    See: TROUBLESHOOTING.md#handshake_failed
+```
+
+The exit status is the symbolic code's numeric value (`0` on success,
+`90` for `MIXED` if more than one failure class occurred, otherwise
+the dominant phase's stable code: `20`/`21`/`22` for TCP, `30`/`31`/`32`
+for probe, `40`-`50` for handshake, `60`/`61` for RPC, `70`-`72` for
+kTLS counter errors).
+
+The full canonical taxonomy is dumped by:
+
+```bash
+./nfs_tls_test --print-error-table
+```
+
+The `SYMBOL` and `#anchor` are stable identifiers from
+`src/tls_error.h` -- safe to match on in CI scripts and bug reports.
+
 ---
 
 ## nfs_tls_server

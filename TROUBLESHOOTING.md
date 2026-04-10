@@ -816,6 +816,236 @@ is probably in the NFS server's TLS integration (server-side bug)
 or in a kernel TLS edge case.  Capture everything and file an
 upstream bug.
 
+## nfs_tls_test error reference
+
+When `nfs_tls_test` detects a failure it prints a line of the form:
+
+```
+[ERROR <SYMBOL>]  (<count> failure(s))
+    <description>
+    Fix: <suggestion>
+    See: TROUBLESHOOTING.md#<anchor>
+```
+
+The `<SYMBOL>` and `<anchor>` are stable identifiers from the
+canonical taxonomy in `src/tls_error.h` and can be matched on by CI
+tooling.  The full table is available via:
+
+```
+./nfs_tls_test --print-error-table
+```
+
+The exit status is the symbolic code's numeric value (e.g. 41 for
+`CERT_EXPIRED`), or `90` (`MIXED`) if more than one failure class
+occurred in the same run, or `0` on success.  Codes are spaced (10,
+11, 12, ... 20, 21, ... 99) so the taxonomy can grow without
+renumbering.
+
+The subsections below collect the more common nfs_tls_test failure
+modes with the same anchor names that appear in the runtime output.
+Many of them cross-reference earlier sections in this document.
+
+### kernel_too_old
+
+The Linux kernel on the client (or server) is below the NFS-over-TLS
+support floor.  See `### Kernel version` above for the exact required
+versions and how to verify with `uname -r`.
+
+### no_sunrpc_tls_config
+
+Kernel was built without `CONFIG_SUNRPC_TLS`.  Verify with:
+
+```
+zgrep CONFIG_SUNRPC_TLS /proc/config.gz   # if exposed
+grep CONFIG_SUNRPC_TLS /boot/config-$(uname -r)
+```
+
+The fix is to use a kernel built with `CONFIG_SUNRPC_TLS=y` or `=m`.
+Distros that ship NFS-over-TLS support enable this by default.
+
+### no_tls_module
+
+Kernel TLS module is not loaded.  Run `modprobe tls` and verify with
+`lsmod | grep ^tls`.  If the module load itself fails, the kernel
+was built without `CONFIG_TLS=y` or `=m`.
+
+### no_tlshd
+
+`tlshd` binary not installed.  Install the `ktls-utils` package
+(distro-specific name varies).  See `### tlshd installed and running`
+above.
+
+### tlshd_not_running
+
+`tlshd` is installed but not running.  See `### tlshd installed and
+running` above.
+
+### openssl_too_old
+
+The OpenSSL library `nfs_tls_test` was linked against is too old to
+speak TLS 1.3.  Rebuild against OpenSSL >= 1.1.1.  Note this is the
+*client tool's* OpenSSL, not the kernel's.
+
+### tcp_refused
+
+TCP-level rejection by the server before any TLS work happens.  See
+`### Phase 1: TCP connect` above for the full debugging steps.
+Quick check: `nc -vz server 2049`.
+
+### tcp_timeout
+
+TCP `connect()` timed out.  Almost always firewall, network MTU
+issues, or the server is unreachable.  See `### Phase 1: TCP connect`.
+
+### tcp_host_not_found
+
+DNS resolution for `--host` failed.  Verify the spelling, then
+`getent hosts <name>` and `dig +short <name>` to isolate the
+resolver.
+
+### probe_rejected
+
+The server received the AUTH_TLS NULL probe and rejected it
+explicitly with an RPC error.  See `### Phase 2: AUTH_TLS probe`
+above.  The most common cause is that the server's NFS daemon does
+not implement RFC 9289 STARTTLS at all.
+
+### probe_malformed_reply
+
+Server responded to the probe but the reply was not parseable as a
+well-formed RPC reply.  This is a server bug -- the server's
+RFC 9289 implementation has a wire-format issue.  Capture and file
+an upstream bug.
+
+### probe_no_starttls
+
+The server's RPC reply indicated it does not support STARTTLS upgrade.
+Enable TLS in the server's NFS configuration (commonly `tls=y` in
+`/etc/nfs.conf` for Linux nfs-server, or the equivalent for the
+server vendor).
+
+### handshake_failed
+
+Generic catch-all for `SSL_connect()` failure with no more specific
+classification.  The most actionable next step is to capture the
+keylog and decrypt the handshake in Wireshark:
+
+```
+./nfs_tls_test --host server --keylog /tmp/keylog.txt --iterations 1
+```
+
+See `## Decrypted packet capture` above for the full procedure.
+
+### cert_expired
+
+Server certificate has expired.  Run `nfs_cert_info --cert
+server.crt` (or `openssl x509 -in server.crt -noout -dates`) to see
+`notBefore` / `notAfter`.  Renew the cert.
+
+### cert_not_yet_valid
+
+The server certificate's `notBefore` is in the future.  Almost
+always a client/server clock skew problem.  Check NTP on both ends:
+
+```
+chronyc tracking
+timedatectl status
+```
+
+### cert_untrusted
+
+The client did not trust the server's certificate chain.  Either
+add the issuing CA to the client trust store, or pass it explicitly
+via `--ca-cert`.  See `### Trust store membership` above.
+
+### cert_hostname
+
+Server presented a certificate but the CN/SAN did not match the
+hostname or IP that `--host` resolved to.  Run:
+
+```
+./nfs_cert_info --cert server.crt
+```
+
+and inspect the SAN list.  Reissue the cert with the correct
+DNS/IP entries.
+
+### cert_revoked
+
+The server certificate has been revoked.  Issue a new certificate.
+
+### cert_key_mismatch
+
+The server's certificate and private key do not match -- this is a
+server-side configuration error.  See `### Verify the cert/key pair
+matches` above.
+
+### alpn_mismatch
+
+Per RFC 9289 §4, the server must negotiate ALPN protocol `sunrpc`.
+If your client sees this error, the server's TLS stack did not
+advertise `sunrpc` in its ALPN list.  Confirm the server software
+version supports RFC 9289, and that any TLS profile / cipher policy
+is not stripping ALPN.  Use `--require-alpn sunrpc` to make this a
+hard fail.
+
+### tls_version_too_low
+
+The negotiated TLS version is below 1.3.  RFC 9289 requires
+TLS 1.3.  Configure the server to support and prefer TLS 1.3.  Use
+`--require-tls13` to make this a hard fail.
+
+### san_missing
+
+A specific SAN entry that you required via `--check-san` is not
+present in the server's certificate.  The error message names the
+missing entry.  Reissue the cert.
+
+### no_peer_cert
+
+The server completed (or attempted) the handshake without
+presenting any certificate at all.  The server has TLS misconfigured
+or has no cert loaded.  Check the server's TLS config and logs.
+
+### rpc_failed
+
+The TLS handshake succeeded but the post-handshake NFS NULL RPC was
+rejected.  See `### Phase 4: NFS NULL RPC` above.  For NFSv3-only
+servers, pass `--no-null` to skip this phase.
+
+### rpc_timeout
+
+The NULL RPC after the TLS handshake never completed.  Server NFS
+stack is hung or overloaded.  Check server logs and load.
+
+### ktls_decrypt_error
+
+The kernel TLS layer logged a `TlsDecryptError` during the run (via
+`--snapshot-stats`).  Indicates wire corruption, MITM, or a kernel
+TLS bug.  See `### /proc/net/tls_stat counters` above.
+
+### ktls_rekey_error
+
+`TlsTxRekeyError` or `TlsRxRekeyError` was incremented during the
+run.  TLS 1.3 key update failed; check kernel version and consider
+filing a kernel bug.
+
+### ktls_no_pad_violation
+
+`TlsRxNoPadViolation` was incremented.  This is a `TLS_RX_EXPECT_NO_PAD`
+mis-prediction inside the kernel TLS layer; usually benign.
+
+### mixed
+
+More than one distinct failure class occurred in the same run.
+Inspect the per-phase Error breakdown line and the individual
+`[ERROR ...]` blocks above it for details.
+
+### internal
+
+A tool internal error (out of memory, bad command-line argument).
+Not a TLS or server problem.  File a bug against `nfs-test-tools`.
+
 ## References
 
 - **RFC 9289** -- Towards Remote Procedure Call Encryption By Default
