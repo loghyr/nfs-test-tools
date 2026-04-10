@@ -245,7 +245,8 @@ build_gss_data_null(uint8_t *buf, size_t bufsz,
 	/* Fill record marker */
 	uint32_t body_len = (uint32_t)(pos - 4);
 	size_t mpos = marker_pos;
-	rpc_put_u32(buf, bufsz, &mpos, RPC_LAST_FRAG | body_len);
+	if (!rpc_put_u32(buf, bufsz, &mpos, RPC_LAST_FRAG | body_len))
+		goto overflow;
 	return pos;
 
 overflow:
@@ -347,7 +348,10 @@ parse_data_reply_verifier(const uint8_t *body, size_t body_len,
 
 		uint8_t seq_buf[4];
 		size_t sq = 0;
-		rpc_put_u32(seq_buf, 4, &sq, gc->gc_seq_num);
+		if (!rpc_put_u32(seq_buf, 4, &sq, gc->gc_seq_num)) {
+			snprintf(errbuf, errsz, "DATA reply: seq_buf overflow");
+			return -1;
+		}
 
 		gss_buffer_desc msg_buf;
 		msg_buf.value  = seq_buf;
@@ -466,7 +470,11 @@ parse_data_reply_verifier(const uint8_t *body, size_t body_len,
 		}
 		size_t sp = 0;
 		uint32_t reply_seq;
-		rpc_get_u32(inner_p, inner_len, &sp, &reply_seq);
+		if (!rpc_get_u32(inner_p, inner_len, &sp, &reply_seq)) {
+			snprintf(errbuf, errsz,
+				 "krb5i reply: seq_num read failed");
+			return -1;
+		}
 		if (reply_seq != gc->gc_seq_num) {
 			snprintf(errbuf, errsz,
 				 "krb5i reply: seq_num mismatch "
@@ -493,6 +501,18 @@ parse_data_reply_verifier(const uint8_t *body, size_t body_len,
 			snprintf(errbuf, errsz,
 				 "krb5p reply: databody_priv truncated "
 				 "(len=%u)", wrapped_len);
+			return -1;
+		}
+		/* RFC 2203 S5.3.3: after the wrapped token there must be no
+		 * further data.  A noncompliant server appending trailing
+		 * bytes would otherwise pass silently. */
+		uint32_t wrapped_padded = (wrapped_len + 3u) & ~3u;
+		if (pos + wrapped_padded != body_len) {
+			snprintf(errbuf, errsz,
+				 "krb5p reply: %zu trailing byte%s after "
+				 "databody_priv",
+				 body_len - pos,
+				 (body_len - pos) == 1 ? "" : "s");
 			return -1;
 		}
 		gss_buffer_desc wrapped = { .length = wrapped_len,
@@ -527,7 +547,12 @@ parse_data_reply_verifier(const uint8_t *body, size_t body_len,
 		}
 		size_t sp = 0;
 		uint32_t reply_seq;
-		rpc_get_u32(plain.value, plain.length, &sp, &reply_seq);
+		if (!rpc_get_u32(plain.value, plain.length, &sp, &reply_seq)) {
+			do_release_buffer(gc, &min_stat, &plain);
+			snprintf(errbuf, errsz,
+				 "krb5p reply: seq_num read failed");
+			return -1;
+		}
 		do_release_buffer(gc, &min_stat, &plain);
 		if (reply_seq != gc->gc_seq_num) {
 			snprintf(errbuf, errsz,

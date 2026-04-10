@@ -3,7 +3,7 @@
 /*
  * krb5_parser_tests.c -- offline unit tests for parse_data_reply_verifier.
  *
- * Tests exercise the 10 cases from the review notes:
+ * Tests exercise the 13 cases from the review notes:
  *   1.  Valid SVC_NONE NULL reply (no crypto, verf_len=0)
  *   2.  Valid SVC_INTEG NULL reply (mock verify_mic -> GSS_S_COMPLETE)
  *   3.  Valid SVC_PRIV NULL reply  (mock unwrap -> seq_num + conf_state=1)
@@ -12,8 +12,11 @@
  *   6.  Wrong inner seq_num
  *   7.  SVC_INTEG with bad MIC (mock verify_mic -> GSS_S_BAD_SIG)
  *   8.  SVC_PRIV with conf_state=0 forced
- *   9.  Trailing junk after checksum (the review-found bug, now detected)
+ *   9.  Trailing junk after checksum (SVC_INTEG)
  *  10.  Empty body when SVC_INTEG was requested
+ *  11.  XID mismatch in reply header
+ *  12.  RPC_MSG_DENIED reply (not accepted)
+ *  13.  Trailing junk after wrapped token (SVC_PRIV, RFC 2203 S5.3.3)
  *
  * Mock injection:
  *   All tests set verf_len=0 in the reply so the header gss_verify_mic call
@@ -86,10 +89,10 @@ static void put_opaque(uint8_t *buf, size_t *pos,
  *
  * Returns the buffer position immediately after accept_stat (= body start).
  */
-static size_t build_reply_header(uint8_t *buf, size_t bufsz,
+static size_t build_reply_header(uint8_t *buf,
+				 size_t bufsz __attribute__((unused)),
 				 uint32_t xid, uint32_t verf_len)
 {
-	(void)bufsz;
 	size_t pos = 0;
 	put_u32(buf, &pos, xid);
 	put_u32(buf, &pos, RPC_REPLY);          /* msg_type = 1 */
@@ -557,6 +560,113 @@ static int test_integ_empty_body(void)
 }
 
 /* -----------------------------------------------------------------------
+ * test_wrong_xid
+ *
+ * Build a valid SVC_NONE reply with xid=0x1111 but ask the parser to
+ * validate it against expected_xid=0x2222.  The parser must reject it.
+ * --------------------------------------------------------------------- */
+
+static int test_wrong_xid(void)
+{
+	uint8_t buf[256];
+	size_t  body_len = build_reply_header(buf, sizeof(buf), 0x1111u, 0);
+
+	struct gss_ctx gc;
+	test_gc_init(&gc, 1u);
+
+	char errbuf[256] = { 0 };
+	int rc = parse_data_reply_verifier(buf, body_len, 0x2222u, &gc,
+					   RPCSEC_GSS_SVC_NONE,
+					   errbuf, sizeof(errbuf));
+	if (rc == 0) {
+		printf("  expected failure but got success\n");
+		return -1;
+	}
+	if (!strstr(errbuf, "xid")) {
+		printf("  wrong error: %s\n", errbuf);
+		return -1;
+	}
+	return 0;
+}
+
+/* -----------------------------------------------------------------------
+ * test_denied_reply
+ *
+ * Construct a reply with reply_stat=RPC_MSG_DENIED (1).  The parser
+ * must reject it since only RPC_MSG_ACCEPTED (0) is valid here.
+ * --------------------------------------------------------------------- */
+
+static int test_denied_reply(void)
+{
+	uint8_t buf[256];
+	size_t  pos = 0;
+	put_u32(buf, &pos, 0x0042u);        /* xid */
+	put_u32(buf, &pos, RPC_REPLY);      /* msg_type = 1 */
+	put_u32(buf, &pos, 1u);             /* reply_stat = RPC_MSG_DENIED */
+
+	struct gss_ctx gc;
+	test_gc_init(&gc, 1u);
+
+	char errbuf[256] = { 0 };
+	int rc = parse_data_reply_verifier(buf, pos, 0x0042u, &gc,
+					   RPCSEC_GSS_SVC_NONE,
+					   errbuf, sizeof(errbuf));
+	if (rc == 0) {
+		printf("  expected failure but got success\n");
+		return -1;
+	}
+	if (!strstr(errbuf, "reply")) {
+		printf("  wrong error: %s\n", errbuf);
+		return -1;
+	}
+	return 0;
+}
+
+/* -----------------------------------------------------------------------
+ * test_priv_trailing_junk
+ *
+ * Build a valid SVC_PRIV reply then append 4 extra bytes after the
+ * wrapped token.  The RFC 2203 S5.3.3 trailing-junk check (added to
+ * gss_wire.c) must reject it.
+ * --------------------------------------------------------------------- */
+
+static int test_priv_trailing_junk(void)
+{
+	uint8_t buf[512];
+	size_t  body_len = build_reply_header(buf, sizeof(buf), 0x000Bu, 0);
+
+	/* databody_priv opaque: seq_num (4 bytes) wrapped as opaque */
+	uint8_t plain[4];
+	size_t  pp = 0;
+	put_u32(plain, &pp, 1u);            /* seq_num matches gc_seq_num */
+
+	put_opaque(buf, &body_len, plain, (uint32_t)pp);
+
+	/* append 4 bytes of trailing junk -- must be rejected */
+	put_u32(buf, &body_len, 0xDEADBEEFu);
+
+	struct gss_ctx gc;
+	test_gc_init(&gc, 1u);
+	gc.gc_unwrap     = mock_unwrap_ok;
+	gc.gc_release    = mock_release_free;
+	g_mock_unwrap_seq = 1u;
+
+	char errbuf[256] = { 0 };
+	int rc = parse_data_reply_verifier(buf, body_len, 0x000Bu, &gc,
+					   RPCSEC_GSS_SVC_PRIV,
+					   errbuf, sizeof(errbuf));
+	if (rc == 0) {
+		printf("  expected failure but got success\n");
+		return -1;
+	}
+	if (!strstr(errbuf, "trailing")) {
+		printf("  wrong error: %s\n", errbuf);
+		return -1;
+	}
+	return 0;
+}
+
+/* -----------------------------------------------------------------------
  * main
  * --------------------------------------------------------------------- */
 
@@ -572,6 +682,9 @@ int main(void)
 	RUN_TEST(test_priv_no_conf);
 	RUN_TEST(test_integ_trailing_junk);
 	RUN_TEST(test_integ_empty_body);
+	RUN_TEST(test_wrong_xid);
+	RUN_TEST(test_denied_reply);
+	RUN_TEST(test_priv_trailing_junk);
 
 	printf("\n%d passed, %d failed\n", g_pass, g_fail);
 	return g_fail ? 1 : 0;

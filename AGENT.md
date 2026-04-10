@@ -90,6 +90,7 @@ except when multiple phases fail: then 90 (MIXED).
 | 170-179 | RPCSEC_GSS | — | Wire RPCSEC_GSS failures, WRONGSEC, replay |
 | 190-193 | IDMAP | — | Identity mapping failures |
 | 250 | — | MIXED | `--stress` run had more than one failure class |
+| 255 | — | INTERNAL | Tool/transport bug; file an issue |
 
 Use `--print-error-table` to see all codes and their fix suggestions.
 
