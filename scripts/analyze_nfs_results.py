@@ -3,8 +3,9 @@
 #
 # analyze_nfs_results.py -- parse and evaluate nfs-test-tools output
 #
-# Reads the ASCII output of nfs_tls_test or nfs_krb5_test, applies
-# pass/fail thresholds, and prints a structured verdict.
+# Reads the ASCII output of nfs_tls_test or nfs_krb5_test (or the
+# JSON output of `nfs_tls_test --output json`), applies pass/fail
+# thresholds, and prints a structured verdict.
 #
 # Exit codes:
 #   0  PASS  -- all checks passed
@@ -17,6 +18,7 @@
 #   scripts/analyze_nfs_results.py --warn-handshake-p99 50 results.txt
 
 import argparse
+import json
 import re
 import sys
 from dataclasses import dataclass, field
@@ -55,6 +57,7 @@ class TlsResult:
     fail_handshake: int = 0
     fail_rpc: int = 0
     samples_dropped: bool = False
+    from_json: bool = False     # parsed via parse_tls_json (no version data)
 
 
 @dataclass
@@ -160,6 +163,67 @@ def parse_tls(lines: list) -> Optional[TlsResult]:
     return r
 
 
+def parse_tls_json(text: str) -> Optional[TlsResult]:
+    """Parse the JSON shape emitted by `nfs_tls_test --output json`.
+
+    The JSON has no TLS version/cipher/curve fields (those are still text-
+    only via --tls-info), so the version-related findings will be reported
+    as "not reported" when consuming JSON input.  Everything else --
+    counts, error breakdown, per-phase percentiles -- maps directly.
+    """
+    text = text.strip()
+    if not text.startswith('{'):
+        return None
+    try:
+        doc = json.loads(text)
+    except json.JSONDecodeError:
+        return None
+    if not isinstance(doc, dict) or 'phases_ms' not in doc:
+        return None
+
+    r = TlsResult()
+    r.from_json = True
+    host = doc.get('host', '?')
+    port = doc.get('port', '?')
+    threads = doc.get('threads', 0)
+    r.header = f"{host}:{port}, threads={threads} (json)"
+
+    r.conn_ok = int(doc.get('ok', 0))
+    fail_total = int(doc.get('fail', 0))
+
+    fb = doc.get('fail_breakdown', {}) or {}
+    r.fail_tcp       = int(fb.get('tcp', 0))
+    r.fail_probe     = int(fb.get('probe', 0))
+    r.fail_handshake = int(fb.get('handshake', 0))
+    r.fail_rpc       = int(fb.get('rpc', 0))
+
+    # The JSON 'fail' total may differ from the breakdown sum if a future
+    # tool version adds new categories; trust whichever is larger so we
+    # don't under-report.
+    r.conn_fail = max(fail_total,
+                      r.fail_tcp + r.fail_probe + r.fail_handshake + r.fail_rpc)
+
+    sessions = doc.get('sessions', {}) or {}
+    r.sessions_resumed = int(sessions.get('resumed', 0))
+    r.sessions_full    = int(sessions.get('full_handshake', 0))
+
+    phases = doc.get('phases_ms', {}) or {}
+    for name, vals in phases.items():
+        if not isinstance(vals, dict):
+            continue
+        r.phase[name] = PhaseStats(
+            p50  = float(vals.get('p50',  0.0)),
+            p95  = float(vals.get('p95',  0.0)),
+            p99  = float(vals.get('p99',  0.0)),
+            p999 = float(vals.get('p999', 0.0)),
+            avg  = float(vals.get('avg',  0.0)),
+            min  = float(vals.get('min',  0.0)),
+            max  = float(vals.get('max',  0.0)),
+        )
+
+    return r
+
+
 def parse_krb5(lines: list) -> Optional[Krb5Result]:
     r = Krb5Result()
 
@@ -261,7 +325,7 @@ def analyze_tls(r: TlsResult, th: Thresholds) -> list:
             add('FAIL', f'phase_{phase}',
                 f"{count} {phase} failure(s): {cause}")
 
-    # TLS version
+    # TLS version (only meaningful for text input; JSON shape omits it)
     if r.tls_version:
         if r.tls_version != th.warn_tls_version:
             add('WARN', 'tls_version',
@@ -270,7 +334,7 @@ def analyze_tls(r: TlsResult, th: Thresholds) -> list:
         else:
             add('PASS', 'tls_version',
                 f"{r.tls_version}, {r.tls_cipher}, {r.tls_curve}")
-    else:
+    elif not r.from_json:
         add('WARN', 'tls_version',
             "TLS version not reported (was --tls-info passed?)")
 
@@ -420,11 +484,15 @@ Exit codes:
   2  WARN  no FAILs but at least one WARN
 
 Examples:
-  # Pipe directly from the tool
+  # Pipe directly from the tool (text output)
   ./src/nfs_tls_test --host SERVER --threads 4 --tls-info 2>&1 | %(prog)s
 
-  # Analyze a saved file
+  # Pipe JSON output (recommended for CI: stable shape, no parsing fragility)
+  ./src/nfs_tls_test --host SERVER --threads 4 --output json | %(prog)s
+
+  # Analyze a saved file (text or JSON, auto-detected)
   %(prog)s results.txt
+  %(prog)s results.json
 
   # Loosen handshake threshold for a cross-datacenter run
   %(prog)s --warn-handshake-p99 150 --fail-handshake-p99 800 results.txt
@@ -463,6 +531,11 @@ def main():
 
     lines = text.splitlines()
 
+    # Try JSON first; fall back to text parsers if not JSON.  JSON output
+    # from `nfs_tls_test --output json` is the entire stdout, so we can
+    # detect it by the leading '{'.
+    tls_result_json = parse_tls_json(text)
+
     th = Thresholds(
         warn_tcp_p99_ms=args.warn_tcp_p99,
         fail_tcp_p99_ms=args.fail_tcp_p99,
@@ -473,9 +546,10 @@ def main():
         warn_session_reuse_pct=args.warn_session_reuse,
     )
 
-    # Auto-detect tool from output
-    tls_result = parse_tls(lines)
-    krb5_result = parse_krb5(lines)
+    # Auto-detect tool from output.  Prefer JSON if it parsed; fall back
+    # to the text parser otherwise.
+    tls_result = tls_result_json or parse_tls(lines)
+    krb5_result = parse_krb5(lines) if tls_result_json is None else None
 
     verdicts = []
 
@@ -492,7 +566,8 @@ def main():
     if not verdicts:
         print("error: could not detect nfs_tls_test or nfs_krb5_test output",
               file=sys.stderr)
-        print("  Expected header line starting with 'nfs_tls_test:' or 'nfs_krb5_test:'",
+        print("  Expected header line starting with 'nfs_tls_test:' or "
+              "'nfs_krb5_test:', or JSON from --output json",
               file=sys.stderr)
         sys.exit(1)
 
