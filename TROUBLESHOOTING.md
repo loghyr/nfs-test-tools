@@ -1046,12 +1046,670 @@ Inspect the per-phase Error breakdown line and the individual
 A tool internal error (out of memory, bad command-line argument).
 Not a TLS or server problem.  File a bug against `nfs-test-tools`.
 
+## NFS over Kerberos
+
+Kerberized NFS (sec=krb5, krb5i, krb5p) is three systems glued
+together: Kerberos itself (auth), RPCSEC_GSS (RFC 2203), and NFSv4
+identity mapping.  Failures in any layer surface as generic NFS
+errors (`EIO`, `permission denied`, `nobody:nobody`), and the
+documentation is famously scattered.  This section gathers the
+known failure modes that `nfs_krb5_test` can detect, with stable
+anchor names matching the symbolic codes the runtime emitter
+prints.
+
+### Mental model
+
+```
+   user / nfs.gssd ──┐
+                    │ kinit, klist, keytab
+                    ▼
+          ┌─────────────────┐         ┌────────────┐
+          │   libkrb5       │ ◀────── │ krb5.conf  │
+          │  (this process) │         │ keytab     │
+          └────────┬────────┘         └────────────┘
+                   │ TGT  / service ticket
+                   ▼
+          ┌─────────────────┐
+          │     KDC         │
+          └────────┬────────┘
+                   │ ticket
+                   ▼
+          ┌─────────────────┐
+          │     GSS-API     │  init_sec_context, get_mic, wrap
+          └────────┬────────┘
+                   │ context handle, tokens
+                   ▼
+          ┌─────────────────┐
+          │  RPCSEC_GSS     │  RFC 2203: cred + verifier wire format
+          │  (NFS / kernel) │  per-call seq_num, replay window
+          └────────┬────────┘
+                   │ NFS ops (open, read, lookup, secinfo)
+                   ▼
+          ┌─────────────────┐
+          │ nfsidmap        │  uid <-> name@DOMAIN mapping
+          └─────────────────┘
+```
+
+The four layers correspond directly to the phases the runtime tool
+classifies failures into: PRE_FLIGHT (config / keytab / hostname),
+KERBEROS (libkrb5 talking to the KDC), GSS (the GSS-API abstraction
+above libkrb5), RPCSEC_GSS (the RFC 2203 wire layer), and IDMAP
+(post-auth identity mapping).
+
+### KRB5_TRACE -- the most useful single tool
+
+When a krb5 failure isn't obvious, set `KRB5_TRACE` to a file path
+and re-run.  libkrb5 will write every step it takes to that file:
+which keytab entry it picked, which KDC it contacted, which enctype
+it negotiated, which ticket it cached.
+
+```
+KRB5_TRACE=/dev/stderr nfs_krb5_test --host server --verbose
+
+# or via the tool's flag:
+nfs_krb5_test --host server --krb5-trace /tmp/krb5.log
+```
+
+**Critical scope limitation:** `KRB5_TRACE` only captures libkrb5
+calls made *inside the process where it is set*.  Mount-time NFS
+failures happen inside `rpc.gssd` (or `gssproxy`), not inside
+`mount.nfs` or this tool.  When the failure is on the kernel-side
+mount path you also need:
+
+```
+# kernel rpcdebug:
+rpcdebug -m rpc -s auth
+
+# rpc-gssd journal:
+journalctl -u rpc-gssd -f
+
+# gssproxy journal (modern distros):
+journalctl -u gssproxy -f
+```
+
+### Active probing with nfs_krb5_test
+
+```
+# Pre-flight: validate the local krb5 environment without touching
+# the network at all.
+./nfs_krb5_test --diagnose
+
+# Single-shot connectivity check (sec=krb5, auth only):
+./nfs_krb5_test --host server
+
+# Integrity (krb5i): proves the server can verify a MIC over the
+# RPC arguments, not just the call header.
+./nfs_krb5_test --host server --sec krb5i
+
+# Privacy (krb5p): proves the server can decrypt wrapped arguments.
+./nfs_krb5_test --host server --sec krb5p
+
+# Stress mode: 10000 calls on a single context, churning the seq_num
+# against the server's RPCSEC_GSS replay window.  Aggregates per-
+# symbolic-code failure counts and reports them at the end.
+./nfs_krb5_test --host server --sec krb5p --iterations 10000 --stress
+
+# With libkrb5 trace capture for in-process failures:
+./nfs_krb5_test --host server --krb5-trace /tmp/krb5.log --verbose
+
+# Print the full krb5 error taxonomy as a markdown table:
+./nfs_krb5_test --print-error-table
+```
+
+### nfs_krb5_test error reference
+
+When `nfs_krb5_test` detects a failure it prints a line of the form:
+
+```
+[ERROR <SYMBOL>]  (<context>)
+    <description>
+    Fix: <suggestion>
+    See: TROUBLESHOOTING.md#<anchor>
+```
+
+The `<SYMBOL>` and `<anchor>` are stable identifiers from the
+canonical taxonomy in `src/krb5_error.h`.  The exit status is the
+symbolic code's numeric value (100..199 for krb5-domain failures,
+or `250` (`MIXED`) if more than one class occurred in the same run).
+
+The subsections below match the anchors emitted at runtime.  Many
+of them describe failures that the tool can also detect during
+pre-flight via `--diagnose`.
+
+#### Pre-flight (local environment)
+
+##### no_krb5_conf
+
+`/etc/krb5.conf` is missing or unreadable.  libkrb5 cannot determine
+the realm, KDC location, or default options.
+
+```
+ls -lZ /etc/krb5.conf      # check existence and SELinux label
+cat /etc/krb5.conf | head  # confirm it's a real config, not empty
+```
+
+Fix: install or restore the file, or set `KRB5_CONFIG` to point at
+an alternate location.
+
+##### krb5_conf_parse
+
+`/etc/krb5.conf` exists but libkrb5 fails to parse it.  Most often
+a missing closing `}` after a stanza, or a syntax error in
+`[realms]`.
+
+```
+klist 2>&1 | head            # libkrb5 prints the parser error
+```
+
+Fix the line libkrb5 names.
+
+##### no_default_realm
+
+`[libdefaults]` has no `default_realm` set.  Many tools (including
+`mount.nfs`) need this to construct service principal names.
+
+```
+[libdefaults]
+    default_realm = EXAMPLE.COM
+```
+
+##### no_keytab_file
+
+`/etc/krb5.keytab` does not exist.  Without it, the host has no
+machine credential and `rpc.gssd -n` can't acquire one for the
+mount path.
+
+Generate or restore via `kadmin ktadd nfs/<host>@REALM` (or your
+distro's equivalent), then verify with `klist -k`.
+
+##### keytab_not_readable
+
+The keytab exists but the current uid cannot read it.  Two common
+causes:
+
+1. **Unix permissions.** Default is mode `0600` owned by `root`.
+   The tool runs as a non-root user.
+2. **SELinux file context.** The keytab must be labeled
+   `krb5_keytab_t`.  Check with `ls -Z /etc/krb5.keytab`; relabel
+   via `restorecon /etc/krb5.keytab` if needed.
+
+##### no_nfs_principal
+
+The keytab is readable but does not contain an `nfs/<host>@REALM`
+service principal.  Without one, the host cannot accept inbound
+GSS contexts and (depending on configuration) cannot initiate
+outbound ones either.
+
+```
+klist -k /etc/krb5.keytab | grep nfs/
+```
+
+If the list is empty, add the principal via your KDC's admin tool
+and re-export the keytab.
+
+##### no_gssproxy_or_gssd
+
+Neither `gssproxy` nor `rpc.gssd` is running.  One of them must be
+present to broker GSS context establishment for the kernel NFS
+client.
+
+```
+systemctl status gssproxy   # modern distros
+systemctl status rpc-gssd   # legacy
+systemctl enable --now gssproxy
+```
+
+Modern Fedora / RHEL 8+ defaults to `gssproxy`; older systems use
+`rpc.gssd`.  Some distros run both, which is fine but redundant.
+
+##### no_nfsidmap
+
+`nfsidmap` is not installed.  NFSv4 cannot map uids to names without
+it.  Symptom: every file appears as `nobody:nobody`.
+
+Install `nfs-utils` or `libnfsidmap` per your distro's packaging.
+
+##### hostname_not_fqdn
+
+The local hostname is a short name without a domain part (e.g.
+`client` instead of `client.example.com`).  Kerberos service
+principals are derived from canonical FQDNs; a short hostname
+breaks principal-form matching at runtime.
+
+```
+hostnamectl set-hostname client.example.com
+```
+
+##### rdns_mismatch
+
+Forward and reverse DNS for the local hostname disagree.  Kerberos
+authenticates by canonical name, and many KDC / NFS-server
+combinations rely on the reverse PTR matching the forward A/AAAA
+record.
+
+Either fix DNS so that they agree, or set `rdns = false` in
+`[libdefaults]` (with the caveat that some KDCs reject AS_REQs from
+clients with broken reverse DNS regardless).
+
+#### Kerberos / libkrb5
+
+##### clock_skew
+
+Clock skew between the client and the KDC exceeds the allowed
+window (default 5 minutes).  This is *the* number-one cause of
+"works on my workstation, fails on the server" Kerberos issues.
+
+```
+chronyc tracking
+chronyc sources
+timedatectl status
+```
+
+Both ends must be within the skew window.  Note: the *server's*
+clock must also agree with the KDC's; a skew between the NFS
+server and the KDC will surface as failures on the client even if
+the client's clock is fine.
+
+##### kdc_unreachable
+
+libkrb5 could not reach any KDC for the realm.  Causes:
+
+- Wrong `kdc =` entries in `/etc/krb5.conf [realms]`
+- DNS SRV records (`_kerberos._tcp.REALM`) missing or wrong, when
+  using `dns_lookup_kdc = true`
+- Firewall blocking outbound port 88 (TCP and/or UDP)
+- KDC service down
+
+```
+KRB5_TRACE=/dev/stderr kinit user@REALM
+```
+
+The trace shows which KDCs are tried and the failure for each.
+
+##### no_tgt
+
+No Kerberos TGT in the user's credential cache.  For a user-initiated
+mount this means the user hasn't run `kinit`.  For a machine-cred
+path (mount triggered by `rpc.gssd -n` or `gssproxy`) it means the
+machine couldn't obtain a TGT from its keytab -- check the daemon
+logs.
+
+##### tgt_expired
+
+The TGT has expired.  Kerberos default lifetime is 10 hours; long-
+lived NFS mounts need automatic renewal (sssd, k5start, gssproxy
+with appropriate config).  Run `kinit -R` to renew or `kinit
+user@REALM` to re-acquire.
+
+##### tgt_not_yet_valid
+
+The TGT's `starttime` is in the future.  Almost always a clock skew
+on the KDC at issue time -- check NTP on the KDC, not on the client.
+
+##### keytab_no_principal
+
+`gss_init_sec_context` (or `gss_acquire_cred`) needed a principal
+that wasn't in the keytab.  Distinct from `no_nfs_principal` in
+that this is detected at runtime against a specific principal name
+the runtime constructed (which may differ from `nfs/<host>` in
+unusual configurations).
+
+##### bad_enctype
+
+KDC returned `KRB5KDC_ERR_ETYPE_NOSUPP`: no enctype the KDC supports
+overlaps with what the keytab carries.  Most often after a FIPS
+toggle or a `permitted_enctypes` change.
+
+```
+klist -ket /etc/krb5.keytab    # see the keytab's enctypes
+```
+
+Add `aes256-cts-hmac-sha1-96` (or `aes128-cts-hmac-sha1-96`) to
+`permitted_enctypes` in krb5.conf and re-key the principal in the
+KDC database.
+
+##### enctype_negotiation
+
+Three-way intersection of (keytab enctypes, krb5.conf
+`permitted_enctypes`, KDC's allowed enctypes for this principal) is
+empty.  Distinct from `bad_enctype` in that the keytab and the KDC
+each support enctypes individually but they don't overlap.
+
+Inspect all three sets and ensure at least one common enctype.
+
+##### principal_unknown
+
+KDC returned `KRB5KDC_ERR_S_PRINCIPAL_UNKNOWN`: the service
+principal does not exist in the KDC database.  Either add it via
+`kadmin`, or fix the SPN form the client requested.
+
+##### preauth_failed
+
+Pre-authentication failed.  Wrong password, locked account, or a
+PA-DATA mismatch.  Check the KDC logs for the specific reason.
+
+##### bad_kvno
+
+`KRB5KRB_AP_ERR_BADKEYVER`: the keytab and the KDC database disagree
+on the principal's key version.  Caused by re-keying the principal
+on one side (KDC or keytab) without propagating to the other.  Fix
+by re-keying via `kadmin ktadd` so both sides see the same kvno.
+
+##### bad_integrity
+
+`KRB5KRB_AP_ERR_BAD_INTEGRITY`: ticket decryption failed.  Common
+causes:
+
+- Stale keytab on the server (re-keyed principal not re-exported)
+- Cross-realm trust chain broken at one hop
+- Clock skew large enough to invalidate the ticket key derivation
+
+A `KRB5_TRACE` capture on both ends usually identifies which.
+
+##### principal_form
+
+Principal name form mismatch -- e.g. `nfs/host@REALM` vs
+`nfs/host.fqdn@REALM`.  Distinct from `rdns_mismatch` (which is
+about DNS round-trips).  Use the FQDN form everywhere and align
+with what the KDC has registered.
+
+##### not_us
+
+`KRB5_AP_ERR_NOT_US`: the server thinks the ticket presented is for
+a different principal.  Almost always caused by hostname
+canonicalization disagreeing between the client and server (rdns,
+`dns_canonicalize_hostname`, the hostname the kernel knows itself
+by vs the one DNS resolves it to).
+
+##### bad_realm
+
+A cross-realm path is missing or broken.  Verify `[domain_realm]`
+mapping in krb5.conf, the trust direction in the KDC database,
+and `[capaths]` if you use it.
+
+#### GSS-API layer
+
+##### gss_bad_name
+
+`gss_import_name` returned `GSS_S_BAD_NAME`.  The principal string
+is not in a form acceptable to `GSS_C_NT_HOSTBASED_SERVICE`
+(`service@host`) or `GSS_C_NT_KRB5_PRINCIPAL_NAME`
+(`service/host@REALM`).
+
+##### gss_bad_mech
+
+The GSS mechanism the caller asked for is not available.  Either
+the krb5 GSS-API mech (gssapi-krb5) is not installed, or the
+mech list ordering is wrong.
+
+##### gss_no_cred
+
+`gss_acquire_cred` or `gss_init_sec_context` returned
+`GSS_S_NO_CRED`.  No usable initiator credential is available --
+either there is no TGT in the user's ccache, or the machine
+credential path can't see the keytab.
+
+The reviewer flagged that this code is indistinguishable from "KCM
+ccache daemon is down" at the GSS-API level, so this taxonomy
+intentionally collapses both into one symbol.
+
+##### gss_defective_token
+
+Server returned a token that GSS-API could not parse.  Indicates a
+server-side GSS bug or wire corruption.  Capture the exchange and
+inspect the server logs.
+
+##### gss_defective_cred
+
+Local credential is malformed.  Re-run `kinit`; if persistent, file
+a libkrb5 bug.
+
+##### gss_cred_expired
+
+The GSS credential expired between when the context was started and
+when a call was made.  Long-lived NFS mounts need automatic
+renewal (sssd, k5start) or a fresh `kinit` cycle.
+
+##### gss_context_expired
+
+The GSS security context itself expired mid-session.  The server
+will return `RPCSEC_GSS_CTXPROBLEM` and the client should
+re-establish the context.  If the client doesn't recover, check
+the rpc.gssd / gssproxy logs.
+
+##### gss_bad_mic
+
+`gss_verify_mic` on a server reply failed.  Indicates wire
+corruption, replay, or context-vs-key desync.  Capture and inspect
+the GSS exchange.
+
+For krb5i, this is the principal failure mode -- if the server's
+MIC over the reply args doesn't verify, the client cannot trust
+the response body.
+
+##### gss_bad_sig
+
+`gss_unwrap` reported a bad signature on a wrapped reply.  Same
+root causes as `gss_bad_mic`; specific to krb5p.
+
+##### gss_init_failed
+
+Generic catch-all for `gss_init_sec_context` failures that the
+classifier couldn't map to a more specific code.  Run with
+`--krb5-trace` and look for the underlying minor-status reason.
+
+#### RPCSEC_GSS wire (RFC 2203)
+
+##### rpcsec_vers_mismatch
+
+Client and server disagree on the RPCSEC_GSS protocol version
+(should be 1 for both).  Check the server-side gssd or NFS daemon
+version.
+
+##### rpcsec_bad_cred
+
+Server rejected the RPCSEC_GSS credential structure.  Wire-format
+issue in the credential body or in the context handle.
+
+##### rpcsec_gss_failed
+
+Generic server-side rejection of an RPCSEC_GSS call after the
+credential parsed.  Check server NFS / gssd logs.
+
+##### rpcsec_ctxproblem
+
+Server returned `RPCSEC_GSS_CTXPROBLEM`: the context the client
+named is expired or unknown.  Most common cause under load is the
+client's seq_num drifting outside the server's replay window.  The
+client should re-establish the context.
+
+If `--stress` mode surfaces this within the first few iterations,
+the server's replay handling is broken.  If it surfaces only after
+hours of activity, the client failed to renew the GSS context
+when its underlying Kerberos credential expired.
+
+##### rpcsec_credproblem
+
+Server returned `RPCSEC_GSS_CREDPROBLEM`: the credentials
+underlying the GSS context have expired (typically the user's TGT).
+Refresh the Kerberos credentials and retry.
+
+##### rpcsec_replay
+
+Server's RPCSEC_GSS replay window detected a duplicate seq_num.
+Default window size is 32; concurrent calls on a shared context
+can interleave seq_nums in a way that overflows it.  Use a fresh
+context per worker, or throttle concurrency.
+
+##### replay_cache_perm
+
+The server-side replay cache file (`/var/tmp/nfs_*` or the krb5
+rcache directory) is owned by the wrong uid or is not writeable.
+Symptom: every authenticated NFS call after the first one fails
+with `GSS_S_DUPLICATE_TOKEN`.  Extremely common, frequently
+misdiagnosed as a Kerberos problem.
+
+```
+ls -l /var/tmp/nfs_*    # check ownership
+ls -lZ /var/tmp/nfs_*   # and SELinux label
+```
+
+Fix: remove the cache files and restart `rpc.gssd` / `gssproxy` so
+they are recreated with correct ownership.
+
+##### wrongsec
+
+Server returned `NFS4ERR_WRONGSEC` for the requested operation.
+The mount used the wrong `sec=` flavor for this export.  The client
+should re-try via SECINFO negotiation, or mount with the flavor the
+server advertises.
+
+The reviewer flagged this as the single most common production
+krb5+NFS failure.  The taxonomy entry exists; an automated probe
+that deliberately exercises SECINFO negotiation is a follow-up
+addition (current `nfs_krb5_test` does not yet trigger SECINFO
+on its own).
+
+##### secinfo_empty
+
+`SECINFO` returned an empty acceptable-flavor list.  The server
+has no acceptable security flavor for this export -- check
+server-side `sec=` configuration and the client's offered flavors.
+
+Like `wrongsec`, the taxonomy entry exists but is reserved for a
+future automated probe.
+
+##### null_rejected
+
+Server rejected an authenticated NULL RPC over RPCSEC_GSS.  This
+indicates the server accepted context establishment but rejected
+the first DATA call.  Check `sec=` flavor agreement and server NFS
+logs.
+
+#### Identity mapping (post-auth)
+
+##### idmap_domain_mismatch
+
+Client and server NFSv4 idmap domains disagree.  Files appear to
+exist (the krb5 context is fine) but every uid/gid maps to
+`nobody:nobody`.
+
+```
+# /etc/idmapd.conf
+[General]
+Domain = example.com   # must match the server's domain
+```
+
+Or for the modern nfsidmap-based path:
+
+```
+# /etc/nfs.conf
+[nfsd]
+v4-id-mapping-domain = example.com
+```
+
+##### idmap_nobody
+
+Files map to `nobody:nobody` despite a working krb5 context.
+Symptom of `idmap_domain_mismatch` or a broken nfsidmap plugin.
+
+```
+nfsidmap -d              # show the configured domain
+journalctl | grep nfsidmap
+```
+
+The reviewer was specific: `idmap_nobody` is a symptom bucket, not
+a distinct cause.  It exists in the taxonomy as a diagnostic flag
+that points the user at `idmap_domain_mismatch` and
+`idmap_plugin_failed`.
+
+##### idmap_plugin_failed
+
+An nfsidmap plugin (sss / umich_ldap / static) failed to load or
+returned an error.
+
+```
+# /etc/idmapd.conf (legacy)
+[Translation]
+Method = sss
+
+# inspect the plugin chain
+nfsidmap -d
+```
+
+Watch `journalctl` for nfsidmap errors after triggering the failure.
+
+##### idmapd_not_running
+
+`rpc.idmapd` is not running.  This applies only to legacy
+NFSv4 client id mapping configurations; modern systems use the
+`nfsidmap` plugin model where no daemon is required.
+
+```
+systemctl enable --now nfs-idmapd
+```
+
+#### Cross-domain aggregates
+
+##### mixed (krb5)
+
+More than one distinct krb5 failure class occurred in the same run.
+Inspect the per-iteration `[ERROR ...]` blocks above the summary.
+
+##### internal (krb5)
+
+A tool internal error (out of memory, transport failure, bad
+command-line argument).  Not a krb5 problem.  File a bug against
+`nfs-test-tools`.
+
+### A Kerberos debugging checklist
+
+When everything is broken and you don't know where to start:
+
+1. **Pre-flight:** `nfs_krb5_test --diagnose` checks the local
+   environment (krb5.conf, keytab, FQDN, gssproxy, nfsidmap).
+2. **Time:** `chronyc tracking` on both ends.  >5 min skew is an
+   instant fail.
+3. **Identity:** `kinit user@REALM`, `klist`, `kvno nfs/<host>` --
+   verify the chain works independently of NFS.
+4. **Keytab:** `klist -k /etc/krb5.keytab | grep nfs/` confirms
+   the service principal is present and what kvno it carries.
+5. **GSS provider:** `systemctl status gssproxy rpc-gssd` -- one
+   should be active.
+6. **Active probe:** `nfs_krb5_test --host server --tls-info` for
+   the basic flavor, then `--sec krb5i` and `--sec krb5p` to verify
+   integrity and privacy services.
+7. **Trace:** `nfs_krb5_test --host server --krb5-trace
+   /tmp/krb5.log --verbose` for in-process libkrb5 detail.  For
+   kernel-side traces use `rpcdebug -m rpc -s auth` plus
+   `journalctl -u rpc-gssd -f`.
+8. **Stress:** `nfs_krb5_test --host server --iterations 1000
+   --stress --sec krb5p` to surface intermittent server-side
+   failures (replay cache, context handling under load).
+9. **Idmap:** if files appear as `nobody:nobody` after a successful
+   mount, the krb5 path is fine; debug the idmap layer instead.
+10. **Wire capture:** `tshark -Y "rpcgss || krb"` to see the
+    GSS-API exchange and the RPCSEC_GSS reject reasons on the wire.
+
+If you get to step 10 and still don't know what's wrong, the
+failure is probably in cross-realm trust, KDC database state, or
+SELinux on the server.  Capture everything and file an upstream
+bug.
+
 ## References
 
 - **RFC 9289** -- Towards Remote Procedure Call Encryption By Default
 - **RFC 5246 / 8446** -- TLS 1.2 / 1.3
+- **RFC 2203** -- RPCSEC_GSS Protocol Specification
+- **RFC 4120** -- The Kerberos Network Authentication Service (V5)
+- **RFC 4121** -- The Kerberos Version 5 GSS-API Mechanism
+- **RFC 2744** -- Generic Security Service API Version 2
 - `tlshd(8)`, `tlshd.conf(5)` man pages
+- `rpc.gssd(8)`, `gssproxy(8)`, `gssproxy.conf(5)` man pages
+- `krb5.conf(5)`, `kadmin(1)`, `klist(1)`, `kinit(1)` man pages
+- `nfsidmap(8)`, `idmapd.conf(5)` man pages
 - Kernel docs: `Documentation/networking/tls.html` (kernel TLS)
 - Kernel docs: `Documentation/filesystems/nfs/` (NFS internals)
 - `ktls-utils` upstream: https://github.com/oracle/ktls-utils
+- MIT Kerberos: https://web.mit.edu/kerberos/
 - Wireshark TLS decryption guide: https://wiki.wireshark.org/TLS

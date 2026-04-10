@@ -422,7 +422,7 @@ keytab on the server.
 ### Usage
 
 ```bash
-# Basic authentication check
+# Basic authentication check (sec=krb5, auth only)
 ./nfs_krb5_test --host SERVER --principal nfs/SERVER@REALM
 
 # Verbose (shows full GSS token exchange)
@@ -433,6 +433,87 @@ keytab on the server.
   --iterations 5 --verbose
 ```
 
+#### Service flavor coverage (krb5 / krb5i / krb5p)
+
+```bash
+# Integrity: SVC_INTEG, MIC over RPC arguments per RFC 2203 S5.3.2
+./nfs_krb5_test --host SERVER --sec krb5i
+
+# Privacy: SVC_PRIV, gss_wrap of RPC arguments per RFC 2203 S5.3.3
+./nfs_krb5_test --host SERVER --sec krb5p
+```
+
+The default `krb5` flavor only proves the authenticator works
+(MIC over the call header).  `--sec krb5i` and `--sec krb5p`
+exercise integrity and privacy services respectively, with
+gss_get_mic / gss_unwrap on the reply body.  Versions of this
+tool prior to the RFC 2203 wire-format work tested only `krb5` --
+the `--sec` flag is the canonical way to verify a server's full
+RPCSEC_GSS implementation.
+
+#### Pre-flight checks
+
+```bash
+./nfs_krb5_test --diagnose
+```
+
+Runs seven local checks without touching the network:
+`/etc/krb5.conf` parse, keytab presence and readability, `nfs/`
+principal in the keytab, user TGT in the ccache, gssproxy or
+rpc.gssd running, nfsidmap installed, FQDN hostname, forward+
+reverse DNS round-trip.  Exit status: 0 = PASS, 1 = FAIL,
+2 = WARN.
+
+#### libkrb5 trace capture
+
+```bash
+./nfs_krb5_test --host SERVER --krb5-trace /tmp/krb5.log --verbose
+```
+
+Sets `KRB5_TRACE` for THIS process so libkrb5 writes its trace
+lines to the named file.  Captures only this binary's libkrb5
+calls -- mount-time failures live in `rpc.gssd` / `gssproxy` and
+need `rpcdebug -m rpc -s auth` plus `journalctl -u rpc-gssd -f`
+instead.
+
+#### Stress mode (replay-cache thrash)
+
+```bash
+./nfs_krb5_test --host SERVER --sec krb5p \
+  --iterations 10000 --stress
+```
+
+Runs all `--iterations` calls on a single context regardless of
+intermittent failures, churning seq_num against the server's
+RPCSEC_GSS replay window.  Reports per-symbolic-code totals at
+the end and exits with the dominant code (or `250` MIXED if more
+than one class fails).
+
+#### Symbolic exit codes
+
+When `nfs_krb5_test` detects a failure it prints one or more
+`[ERROR SYMBOL]` blocks pointing at the matching section of
+`TROUBLESHOOTING.md`:
+
+```
+[ERROR CLOCK_SKEW]  (gss_init_sec_context: maj=0xd0000 min=0x96c73a25)
+    Clock skew vs the KDC exceeds the allowed window (default 5 min)
+    Fix: Sync system clocks via chrony / systemd-timesyncd on both ends
+    See: TROUBLESHOOTING.md#clock_skew
+```
+
+The exit status is the symbolic code's numeric value (`100..199`
+for krb5-domain failures, `0` on success, `250` for `MIXED`).
+The full canonical taxonomy is dumped by:
+
+```bash
+./nfs_krb5_test --print-error-table
+```
+
+The `SYMBOL` and `#anchor` are stable identifiers from
+`src/krb5_error.h` -- safe to match on in CI scripts and bug
+reports.
+
 ### Analyzing results
 
 ```bash
@@ -440,8 +521,11 @@ keytab on the server.
   2>&1 | scripts/analyze_nfs_results.py
 ```
 
-See `AGENT.md` for failure diagnosis (GSS major/minor status
-decoding, missing-step analysis).
+The analyzer extracts the `[ERROR SYMBOL]` blocks regardless of
+which tool produced the output, and surfaces them as
+`krb5_<symbol_lower>` / `tls_<symbol_lower>` findings in its
+verdict.  See `TROUBLESHOOTING.md#nfs-over-kerberos` for the full
+debugging guide and per-symbol playbooks.
 
 ---
 
