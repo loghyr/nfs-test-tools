@@ -9,6 +9,7 @@ nfs_tls_test_SOURCES = \
 	tls_stat.c \
 	nfs_error.c \
 	tls_error.c \
+	diag.c \
 	diagnose.c
 
 nfs_tls_test_CFLAGS  = $(OPENSSL_CFLAGS)
@@ -16,6 +17,7 @@ nfs_tls_test_LDADD   = $(OPENSSL_LIBS) -lm -lpthread
 
 nfs_cert_info_SOURCES = \
 	nfs_cert_info.c \
+	diag.c \
 	diagnose.c
 
 nfs_cert_info_CFLAGS = $(OPENSSL_CFLAGS)
@@ -31,7 +33,9 @@ bin_PROGRAMS += nfs_krb5_test
 nfs_krb5_test_SOURCES = \
 	nfs_krb5_test.c \
 	nfs_error.c \
-	krb5_error.c
+	krb5_error.c \
+	diag.c \
+	diagnose_krb5.c
 nfs_krb5_test_CFLAGS  = $(GSSAPI_CFLAGS)
 nfs_krb5_test_LDADD   = $(GSSAPI_LIBS)
 endif

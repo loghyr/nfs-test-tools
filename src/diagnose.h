@@ -107,6 +107,7 @@ int diag_run(unsigned domains);
  * to call multiple times.
  */
 void diag_init_tls(void);
+void diag_init_krb5(void);
 
 /*
  * diagnose_run -- backward-compatible entry point.
