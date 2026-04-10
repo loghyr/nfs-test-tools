@@ -206,14 +206,44 @@ static size_t build_gss_init_call(uint8_t *buf, size_t bufsz,
 /*
  * build_gss_data_null -- build an RPCSEC_GSS DATA NULL call.
  *
- * RFC 2203 S5.3.3.3: verifier = gss_get_mic over the call header bytes
- * (xid through end of credential body, inclusive).
+ * Service flavor handling per RFC 2203:
  *
- * Returns total byte count, or 0 on error.
+ *   RPCSEC_GSS_SVC_NONE  (krb5)
+ *     - cred.service = SVC_NONE
+ *     - header verifier = gss_get_mic over [xid .. end-of-cred]
+ *     - procedure body  = empty
+ *
+ *   RPCSEC_GSS_SVC_INTEG (krb5i)  -- RFC 2203 S5.3.2
+ *     - cred.service = SVC_INTEG
+ *     - header verifier = gss_get_mic over [xid .. end-of-cred]
+ *     - procedure body  = rpc_gss_integ_data {
+ *           opaque databody_integ<>;  // = u32 seq_num + procedure args
+ *           opaque checksum<>;        // = gss_get_mic(databody_integ)
+ *       }
+ *       For NULL the procedure args are empty so databody_integ is
+ *       just the 4-byte seq_num.
+ *
+ *   RPCSEC_GSS_SVC_PRIV  (krb5p)  -- RFC 2203 S5.3.3
+ *     - cred.service = SVC_PRIV
+ *     - header verifier = gss_get_mic over [xid .. end-of-cred]
+ *     - procedure body  = rpc_gss_priv_data {
+ *           opaque databody_priv<>;   // = gss_wrap(seq_num + args)
+ *       }
+ *       gss_wrap conf_req=1; we verify conf_state on return.
+ *
+ * Historical note: this function used to hardcode SVC_NONE, which
+ * meant the tool actually exercised plain "krb5" (auth only) and
+ * NOT krb5i.  Despite the per-call MIC over the header, the bare
+ * NULL never carried a wrapped argument body, so neither integrity
+ * over the args nor any privacy was tested.  The reviewer flagged
+ * this; this commit fixes the coverage gap.
+ *
+ * Returns total byte count, or 0 on error (errbuf filled).
  */
 static size_t build_gss_data_null(uint8_t *buf, size_t bufsz,
                                    uint32_t xid, uint32_t prog, uint32_t vers,
                                    struct gss_ctx *gc,
+                                   uint32_t service,
                                    char *errbuf, size_t errsz)
 {
     gc->gc_seq_num++;
@@ -241,14 +271,15 @@ static size_t build_gss_data_null(uint8_t *buf, size_t bufsz,
     if (!rpc_put_u32(buf, bufsz, &pos, RPCSEC_GSS_VERSION)) goto overflow;
     if (!rpc_put_u32(buf, bufsz, &pos, RPCSEC_GSS_DATA))   goto overflow;
     if (!rpc_put_u32(buf, bufsz, &pos, gc->gc_seq_num))    goto overflow;
-    if (!rpc_put_u32(buf, bufsz, &pos, RPCSEC_GSS_SVC_NONE)) goto overflow;
+    if (!rpc_put_u32(buf, bufsz, &pos, service))           goto overflow;
     if (!rpc_put_opaque(buf, bufsz, &pos,
                         gc->gc_handle, gc->gc_handle_len)) goto overflow;
 
     /* Record end of header for MIC computation */
     size_t header_end = pos;
 
-    /* Verifier: gss_get_mic over [header_start, header_end) */
+    /* Verifier: gss_get_mic over [header_start, header_end).
+     * Same for all three service flavors. */
     gss_buffer_desc msg_buf;
     msg_buf.value  = buf + header_start;
     msg_buf.length = header_end - header_start;
@@ -259,7 +290,7 @@ static size_t build_gss_data_null(uint8_t *buf, size_t bufsz,
                                       GSS_C_QOP_DEFAULT,
                                       &msg_buf, &mic_buf);
     if (maj_stat != GSS_S_COMPLETE) {
-        snprintf(errbuf, errsz, "gss_get_mic: maj=%u min=%u",
+        snprintf(errbuf, errsz, "gss_get_mic on header: maj=%u min=%u",
                  maj_stat, min_stat);
         return 0;
     }
@@ -271,7 +302,77 @@ static size_t build_gss_data_null(uint8_t *buf, size_t bufsz,
                         (uint32_t)mic_buf.length))        { gss_release_buffer(&min_stat, &mic_buf); goto overflow; }
     gss_release_buffer(&min_stat, &mic_buf);
 
-    /* No procedure body for NULL */
+    /* Procedure body, branching on service flavor.
+     *
+     * For NULL, the "procedure args" are zero bytes, so the inner
+     * databody is just the 4-byte big-endian seq_num. */
+    if (service == RPCSEC_GSS_SVC_NONE) {
+        /* No body */
+    } else if (service == RPCSEC_GSS_SVC_INTEG) {
+        uint8_t inner[4];
+        size_t  inner_pos = 0;
+        rpc_put_u32(inner, sizeof(inner), &inner_pos, gc->gc_seq_num);
+
+        gss_buffer_desc inner_buf = { .length = inner_pos, .value = inner };
+        gss_buffer_desc int_mic   = GSS_C_EMPTY_BUFFER;
+        maj_stat = gss_get_mic(&min_stat, gc->gc_ctx,
+                               GSS_C_QOP_DEFAULT, &inner_buf, &int_mic);
+        if (maj_stat != GSS_S_COMPLETE) {
+            snprintf(errbuf, errsz,
+                     "gss_get_mic on integ databody: maj=%u min=%u",
+                     maj_stat, min_stat);
+            return 0;
+        }
+
+        /* opaque databody_integ<> */
+        if (!rpc_put_opaque(buf, bufsz, &pos, inner, (uint32_t)inner_pos)) {
+            gss_release_buffer(&min_stat, &int_mic);
+            goto overflow;
+        }
+        /* opaque checksum<> */
+        if (!rpc_put_opaque(buf, bufsz, &pos,
+                            int_mic.value, (uint32_t)int_mic.length)) {
+            gss_release_buffer(&min_stat, &int_mic);
+            goto overflow;
+        }
+        gss_release_buffer(&min_stat, &int_mic);
+    } else if (service == RPCSEC_GSS_SVC_PRIV) {
+        uint8_t inner[4];
+        size_t  inner_pos = 0;
+        rpc_put_u32(inner, sizeof(inner), &inner_pos, gc->gc_seq_num);
+
+        gss_buffer_desc inner_buf = { .length = inner_pos, .value = inner };
+        gss_buffer_desc wrapped   = GSS_C_EMPTY_BUFFER;
+        int conf_state = 0;
+        maj_stat = gss_wrap(&min_stat, gc->gc_ctx,
+                            1 /* conf_req */, GSS_C_QOP_DEFAULT,
+                            &inner_buf, &conf_state, &wrapped);
+        if (maj_stat != GSS_S_COMPLETE) {
+            snprintf(errbuf, errsz,
+                     "gss_wrap on priv databody: maj=%u min=%u",
+                     maj_stat, min_stat);
+            return 0;
+        }
+        if (!conf_state) {
+            gss_release_buffer(&min_stat, &wrapped);
+            snprintf(errbuf, errsz,
+                     "gss_wrap returned without confidentiality "
+                     "(server cipher does not support encryption)");
+            return 0;
+        }
+
+        /* opaque databody_priv<> */
+        if (!rpc_put_opaque(buf, bufsz, &pos,
+                            wrapped.value, (uint32_t)wrapped.length)) {
+            gss_release_buffer(&min_stat, &wrapped);
+            goto overflow;
+        }
+        gss_release_buffer(&min_stat, &wrapped);
+    } else {
+        snprintf(errbuf, errsz,
+                 "build_gss_data_null: unknown service flavor %u", service);
+        return 0;
+    }
 
     /* Fill record marker */
     uint32_t body_len = (uint32_t)(pos - 4);
@@ -452,6 +553,7 @@ static int parse_gss_init_reply(const uint8_t *body, size_t body_len,
 static int parse_data_reply_verifier(const uint8_t *body, size_t body_len,
                                       uint32_t expected_xid,
                                       struct gss_ctx *gc,
+                                      uint32_t service,
                                       char *errbuf, size_t errsz)
 {
     size_t pos = 0;
@@ -479,8 +581,13 @@ static int parse_data_reply_verifier(const uint8_t *body, size_t body_len,
         return -1;
     }
 
+    /*
+     * Reply header verifier: gss_get_mic over 4 big-endian seq_num
+     * bytes.  This is identical for SVC_NONE / SVC_INTEG / SVC_PRIV --
+     * the service flavor changes only the procedure body, not the
+     * RPCSEC_GSS reply verifier.
+     */
     if (verf_flavor == RPCSEC_GSS && verf_len > 0) {
-        /* Verify: server MIC is over 4-byte seq_num (big-endian) */
         if (pos + verf_len > body_len) {
             snprintf(errbuf, errsz, "DATA reply: verifier body truncated");
             return -1;
@@ -519,7 +626,148 @@ static int parse_data_reply_verifier(const uint8_t *body, size_t body_len,
         snprintf(errbuf, errsz, "DATA reply: accept_stat %u", accept_stat);
         return -1;
     }
-    return 0;
+
+    /*
+     * Reply procedure body, branching on service flavor.  For NULL
+     * the procedure results are empty, so the inner body should
+     * decode to a 4-byte seq_num matching gc->gc_seq_num.
+     */
+    if (service == RPCSEC_GSS_SVC_NONE) {
+        /* No body to parse. */
+        return 0;
+    }
+
+    if (service == RPCSEC_GSS_SVC_INTEG) {
+        /*
+         * rpc_gss_integ_data {
+         *   opaque databody_integ<>;
+         *   opaque checksum<>;
+         * }
+         */
+        uint32_t inner_len;
+        if (!rpc_get_u32(body, body_len, &pos, &inner_len)) {
+            snprintf(errbuf, errsz,
+                     "krb5i reply: missing databody_integ length");
+            return -1;
+        }
+        if (pos + inner_len > body_len) {
+            snprintf(errbuf, errsz,
+                     "krb5i reply: databody_integ truncated (len=%u)",
+                     inner_len);
+            return -1;
+        }
+        const uint8_t *inner_p = body + pos;
+        uint32_t inner_padded = (inner_len + 3u) & ~3u;
+        if (!rpc_skip(body_len, &pos, inner_padded)) {
+            snprintf(errbuf, errsz, "krb5i reply: databody padding short");
+            return -1;
+        }
+
+        uint32_t mic_len;
+        if (!rpc_get_u32(body, body_len, &pos, &mic_len)) {
+            snprintf(errbuf, errsz, "krb5i reply: missing checksum length");
+            return -1;
+        }
+        if (pos + mic_len > body_len) {
+            snprintf(errbuf, errsz,
+                     "krb5i reply: checksum truncated (len=%u)", mic_len);
+            return -1;
+        }
+        gss_buffer_desc inner_buf = { .length = inner_len,
+                                      .value  = (void *)inner_p };
+        gss_buffer_desc mic_buf   = { .length = mic_len,
+                                      .value  = (void *)(body + pos) };
+        OM_uint32 min_stat, qop_state;
+        OM_uint32 maj_stat = gss_verify_mic(&min_stat, gc->gc_ctx,
+                                             &inner_buf, &mic_buf,
+                                             &qop_state);
+        if (maj_stat != GSS_S_COMPLETE) {
+            snprintf(errbuf, errsz,
+                     "krb5i reply: gss_verify_mic on databody failed "
+                     "maj=%u min=%u", maj_stat, min_stat);
+            return -1;
+        }
+
+        /* Verify the inner seq_num matches. */
+        if (inner_len < 4) {
+            snprintf(errbuf, errsz,
+                     "krb5i reply: databody too short for seq_num");
+            return -1;
+        }
+        size_t sp = 0;
+        uint32_t reply_seq;
+        rpc_get_u32(inner_p, inner_len, &sp, &reply_seq);
+        if (reply_seq != gc->gc_seq_num) {
+            snprintf(errbuf, errsz,
+                     "krb5i reply: seq_num mismatch (got %u expected %u)",
+                     reply_seq, gc->gc_seq_num);
+            return -1;
+        }
+        return 0;
+    }
+
+    if (service == RPCSEC_GSS_SVC_PRIV) {
+        /*
+         * rpc_gss_priv_data {
+         *   opaque databody_priv<>;   // = gss_wrap(seq_num + results)
+         * }
+         */
+        uint32_t wrapped_len;
+        if (!rpc_get_u32(body, body_len, &pos, &wrapped_len)) {
+            snprintf(errbuf, errsz,
+                     "krb5p reply: missing databody_priv length");
+            return -1;
+        }
+        if (pos + wrapped_len > body_len) {
+            snprintf(errbuf, errsz,
+                     "krb5p reply: databody_priv truncated (len=%u)",
+                     wrapped_len);
+            return -1;
+        }
+        gss_buffer_desc wrapped = { .length = wrapped_len,
+                                    .value  = (void *)(body + pos) };
+        gss_buffer_desc plain   = GSS_C_EMPTY_BUFFER;
+        OM_uint32 min_stat;
+        int conf_state = 0;
+        gss_qop_t qop_state = 0;
+        OM_uint32 maj_stat = gss_unwrap(&min_stat, gc->gc_ctx,
+                                         &wrapped, &plain,
+                                         &conf_state, &qop_state);
+        if (maj_stat != GSS_S_COMPLETE) {
+            snprintf(errbuf, errsz,
+                     "krb5p reply: gss_unwrap failed maj=%u min=%u",
+                     maj_stat, min_stat);
+            return -1;
+        }
+        if (!conf_state) {
+            gss_release_buffer(&min_stat, &plain);
+            snprintf(errbuf, errsz,
+                     "krb5p reply: gss_unwrap returned no confidentiality "
+                     "(server did not encrypt the body)");
+            return -1;
+        }
+        if (plain.length < 4) {
+            gss_release_buffer(&min_stat, &plain);
+            snprintf(errbuf, errsz,
+                     "krb5p reply: unwrapped body too short for seq_num");
+            return -1;
+        }
+        size_t sp = 0;
+        uint32_t reply_seq;
+        rpc_get_u32(plain.value, plain.length, &sp, &reply_seq);
+        gss_release_buffer(&min_stat, &plain);
+        if (reply_seq != gc->gc_seq_num) {
+            snprintf(errbuf, errsz,
+                     "krb5p reply: seq_num mismatch (got %u expected %u)",
+                     reply_seq, gc->gc_seq_num);
+            return -1;
+        }
+        return 0;
+    }
+
+    snprintf(errbuf, errsz,
+             "DATA reply: unknown service flavor %u", service);
+    return -1;
 }
 
 /* -----------------------------------------------------------------------
@@ -673,6 +921,7 @@ struct options {
     int         o_verbose;
     int         o_diagnose;          /* run pre-flight checks and exit */
     int         o_print_error_table; /* dump krb5 error taxonomy and exit */
+    uint32_t    o_sec;               /* RPCSEC_GSS_SVC_NONE/INTEG/PRIV */
 };
 
 static void usage(const char *prog)
@@ -687,6 +936,10 @@ static void usage(const char *prog)
             "  --port PORT           Port number (default: 2049)\n"
             "  --principal NAME      Service principal (default: nfs@HOST)\n"
             "  --iterations N        NULL calls after context setup (default: 1)\n"
+            "  --sec FLAVOR          RPCSEC_GSS service flavor (default: krb5)\n"
+            "                        krb5  -- auth only (SVC_NONE)\n"
+            "                        krb5i -- integrity (SVC_INTEG, MIC over args)\n"
+            "                        krb5p -- privacy   (SVC_PRIV, gss_wrap of args)\n"
             "  --verbose             Show GSS exchange details\n"
             "\n"
             "Diagnostic options:\n"
@@ -694,7 +947,10 @@ static void usage(const char *prog)
             "  --print-error-table   Print the krb5 error taxonomy and exit\n"
             "\n"
             "Tests RPCSEC_GSS (RFC 2203) Kerberos 5 context establishment and\n"
-            "authenticated NULL RPC calls against an NFS server.\n"
+            "authenticated NULL RPC calls against an NFS server.  --sec krb5i\n"
+            "and --sec krb5p exercise integrity and privacy services per RFC 2203\n"
+            "S5.3.2 / S5.3.3 respectively; the default krb5 flavor only proves\n"
+            "the authenticator works.\n"
             "\n"
             "Exit status uses the canonical krb5 error taxonomy: 0 on success,\n"
             "100..199 for the dominant failure class, 250 (MIXED) if more than\n"
@@ -704,6 +960,18 @@ static void usage(const char *prog)
     exit(EXIT_FAILURE);
 }
 
+static uint32_t parse_sec_flavor(const char *s, const char *prog)
+{
+    if (strcmp(s, "krb5")  == 0) return RPCSEC_GSS_SVC_NONE;
+    if (strcmp(s, "krb5i") == 0) return RPCSEC_GSS_SVC_INTEG;
+    if (strcmp(s, "krb5p") == 0) return RPCSEC_GSS_SVC_PRIV;
+    fprintf(stderr,
+            "Error: --sec must be one of krb5, krb5i, krb5p (got '%s')\n\n",
+            s);
+    usage(prog);
+    return 0; /* unreachable */
+}
+
 static void parse_options(int argc, char **argv, struct options *o)
 {
     static const struct option long_opts[] = {
@@ -711,6 +979,7 @@ static void parse_options(int argc, char **argv, struct options *o)
         { "port",             required_argument, NULL, 'p' },
         { "principal",        required_argument, NULL, 'P' },
         { "iterations",       required_argument, NULL, 'i' },
+        { "sec",              required_argument, NULL, 'S' },
         { "verbose",          no_argument,       NULL, 'v' },
         { "diagnose",         no_argument,       NULL, 'D' },
         { "print-error-table",no_argument,       NULL, 'E' },
@@ -720,6 +989,7 @@ static void parse_options(int argc, char **argv, struct options *o)
     memset(o, 0, sizeof(*o));
     o->o_port       = "2049";
     o->o_iterations = 1;
+    o->o_sec        = RPCSEC_GSS_SVC_NONE;  /* default: plain krb5 */
 
     int ch;
     while ((ch = getopt_long(argc, argv, "", long_opts, NULL)) != -1) {
@@ -728,6 +998,7 @@ static void parse_options(int argc, char **argv, struct options *o)
         case 'p': o->o_port             = optarg;       break;
         case 'P': o->o_principal        = optarg;       break;
         case 'i': o->o_iterations       = atol(optarg); break;
+        case 'S': o->o_sec = parse_sec_flavor(optarg, argv[0]); break;
         case 'v': o->o_verbose          = 1;            break;
         case 'D': o->o_diagnose         = 1;            break;
         case 'E': o->o_print_error_table = 1;           break;
@@ -778,8 +1049,12 @@ int main(int argc, char **argv)
         opts.o_principal = default_principal;
     }
 
-    printf("nfs_krb5_test: %s:%s principal=%s\n",
-           opts.o_host, opts.o_port, opts.o_principal);
+    const char *sec_label = (opts.o_sec == RPCSEC_GSS_SVC_NONE)  ? "krb5"
+                          : (opts.o_sec == RPCSEC_GSS_SVC_INTEG) ? "krb5i"
+                          : (opts.o_sec == RPCSEC_GSS_SVC_PRIV)  ? "krb5p"
+                                                                 : "?";
+    printf("nfs_krb5_test: %s:%s principal=%s sec=%s\n",
+           opts.o_host, opts.o_port, opts.o_principal, sec_label);
 
     /* --- Connect --- */
     char errbuf[512];
@@ -947,10 +1222,11 @@ int main(int argc, char **argv)
         xid++;
         size_t call_len = build_gss_data_null(call_buf, sizeof(call_buf),
                                                xid, NFS_PROGRAM, NFS_VERSION_4,
-                                               &gc, errbuf, sizeof(errbuf));
+                                               &gc, opts.o_sec,
+                                               errbuf, sizeof(errbuf));
         if (call_len == 0) {
-            /* gss_get_mic over the call header failed -- typically a
-             * dead context. */
+            /* gss_get_mic / gss_wrap over the call body failed --
+             * typically a dead context. */
             nfs_error_emit_one(stderr, KRB5_ERR_GSS_CONTEXT_EXPIRED,
                                errbuf);
             result_code = KRB5_ERR_GSS_CONTEXT_EXPIRED;
@@ -975,7 +1251,8 @@ int main(int argc, char **argv)
             break;
         }
         if (parse_data_reply_verifier(reply_buf, (size_t)rlen, xid,
-                                       &gc, errbuf, sizeof(errbuf)) < 0) {
+                                       &gc, opts.o_sec,
+                                       errbuf, sizeof(errbuf)) < 0) {
             /* Reply verifier (server's MIC) failed gss_verify_mic --
              * either the server's MIC is bad or our context state
              * has drifted. */
