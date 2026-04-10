@@ -77,6 +77,7 @@ struct options {
     int         o_diagnose;        /* 1 = run diagnose_run() and exit */
     int         o_require_tls13;   /* 1 = treat TLS 1.2 as FAIL not WARN */
     const char *o_require_alpn;    /* required ALPN protocol, or NULL */
+    int         o_json;            /* 1 = emit JSON-only report on stdout */
 };
 
 /* --- per-worker state --- */
@@ -408,6 +409,7 @@ static void usage(const char *prog)
         "  --tls-info            Print negotiated TLS version/cipher/ALPN\n"
         "  --histogram           Print ASCII latency histogram\n"
         "  --snapshot-stats      Read /proc/net/tls_stat before/after run\n"
+        "  --output text|json    Report format (default: text)\n"
         "\n"
         "Diagnostic and strict-mode options:\n"
         "  --diagnose            Run local pre-flight checks and exit\n"
@@ -448,6 +450,7 @@ static void parse_options(int argc, char **argv, struct options *o)
         { "diagnose",         no_argument,       NULL, 'D' },
         { "require-tls13",    no_argument,       NULL, '3' },
         { "require-alpn",     required_argument, NULL, 'N' },
+        { "output",           required_argument, NULL, 'O' },
         { NULL, 0, NULL, 0 }
     };
 
@@ -483,6 +486,16 @@ static void parse_options(int argc, char **argv, struct options *o)
         case 'D': o->o_diagnose       = 1;              break;
         case '3': o->o_require_tls13  = 1;              break;
         case 'N': o->o_require_alpn   = optarg;         break;
+        case 'O':
+            if (strcmp(optarg, "json") == 0)
+                o->o_json = 1;
+            else if (strcmp(optarg, "text") == 0)
+                o->o_json = 0;
+            else {
+                fprintf(stderr, "Error: --output must be 'text' or 'json'\n\n");
+                usage(argv[0]);
+            }
+            break;
         default:
             usage(argv[0]);
         }
@@ -668,6 +681,156 @@ static void print_report(const struct options *o,
     free(ms_total); free(ms_tcp); free(ms_probe); free(ms_hs); free(ms_rpc);
 }
 
+/*
+ * print_report_json -- emit the same data as print_report() in JSON.
+ *
+ * The JSON has a stable shape suitable for CI tooling:
+ *
+ *   {
+ *     "host": "...", "port": "...", "threads": N,
+ *     "iterations": N, "duration_s": N,
+ *     "ok": N, "fail": N,
+ *     "fail_breakdown": {
+ *       "tcp": N, "probe": N, "handshake": N, "rpc": N
+ *     },
+ *     "sessions": { "resumed": N, "full_handshake": N },
+ *     "phases_ms": {
+ *       "tcp":       { "p50": .., "p95": .., "p99": .., "p999": .., ... },
+ *       "probe":     { ... },
+ *       "handshake": { ... },
+ *       "rpc":       { ... },        // omitted if --no-null
+ *       "total":     { ... }
+ *     }
+ *   }
+ *
+ * No human-readable preamble: a JSON-only line is the entire stdout.
+ */
+static void print_pct_json(const char *name, const struct pct_result *r,
+                           int last)
+{
+    printf("    \"%s\": { \"p50\": %.3f, \"p95\": %.3f, "
+           "\"p99\": %.3f, \"p999\": %.3f, "
+           "\"avg\": %.3f, \"min\": %.3f, \"max\": %.3f }%s\n",
+           name, r->p50, r->p95, r->p99, r->p999,
+           r->avg, r->min, r->max, last ? "" : ",");
+}
+
+static void print_report_json(const struct options *o,
+                              struct worker *workers, int nworkers,
+                              double elapsed_ms)
+{
+    size_t total = 0;
+    long   total_ok = 0, fail_tcp = 0, fail_probe = 0;
+    long   fail_hs = 0, fail_rpc = 0, resumed = 0;
+
+    for (int i = 0; i < nworkers; i++) {
+        total      += workers[i].w_sa.sa_n;
+        total_ok   += atomic_load_explicit(&workers[i].w_ok,
+                                           memory_order_relaxed);
+        fail_tcp   += atomic_load_explicit(&workers[i].w_fail_tcp,
+                                           memory_order_relaxed);
+        fail_probe += atomic_load_explicit(&workers[i].w_fail_probe,
+                                           memory_order_relaxed);
+        fail_hs    += atomic_load_explicit(&workers[i].w_fail_handshake,
+                                           memory_order_relaxed);
+        fail_rpc   += atomic_load_explicit(&workers[i].w_fail_rpc,
+                                           memory_order_relaxed);
+    }
+
+    double *ms_total = NULL, *ms_tcp = NULL, *ms_probe = NULL;
+    double *ms_hs = NULL, *ms_rpc = NULL;
+    double sum_total = 0.0, sum_tcp = 0.0, sum_probe = 0.0;
+    double sum_hs = 0.0, sum_rpc = 0.0;
+    int have_rpc = (!o->o_no_null && total > 0);
+
+    if (total > 0) {
+        ms_total = (double *)malloc(total * sizeof(double));
+        ms_tcp   = (double *)malloc(total * sizeof(double));
+        ms_probe = (double *)malloc(total * sizeof(double));
+        ms_hs    = (double *)malloc(total * sizeof(double));
+        if (have_rpc)
+            ms_rpc = (double *)malloc(total * sizeof(double));
+
+        if (!ms_total || !ms_tcp || !ms_probe || !ms_hs ||
+            (have_rpc && !ms_rpc)) {
+            free(ms_total); free(ms_tcp); free(ms_probe);
+            free(ms_hs); free(ms_rpc);
+            fprintf(stderr, "report_json: out of memory\n");
+            return;
+        }
+
+        size_t pos = 0;
+        for (int i = 0; i < nworkers; i++) {
+            for (size_t j = 0; j < workers[i].w_sa.sa_n; j++) {
+                const struct sample *s = &workers[i].w_sa.sa_samples[j];
+                ms_total[pos] = s->s_total_ms;
+                ms_tcp[pos]   = s->s_tcp_ms;
+                ms_probe[pos] = s->s_probe_ms;
+                ms_hs[pos]    = s->s_handshake_ms;
+                if (have_rpc)
+                    ms_rpc[pos] = s->s_rpc_ms;
+                sum_total += s->s_total_ms;
+                sum_tcp   += s->s_tcp_ms;
+                sum_probe += s->s_probe_ms;
+                sum_hs    += s->s_handshake_ms;
+                if (have_rpc)
+                    sum_rpc += s->s_rpc_ms;
+                if (s->s_resumed)
+                    resumed++;
+                pos++;
+            }
+        }
+
+        qsort(ms_total, total, sizeof(double), cmp_double);
+        qsort(ms_tcp,   total, sizeof(double), cmp_double);
+        qsort(ms_probe, total, sizeof(double), cmp_double);
+        qsort(ms_hs,    total, sizeof(double), cmp_double);
+        if (have_rpc)
+            qsort(ms_rpc, total, sizeof(double), cmp_double);
+    }
+
+    long full_hs = total_ok - resumed;
+
+    printf("{\n");
+    printf("  \"host\": \"%s\",\n", o->o_host);
+    printf("  \"port\": \"%s\",\n", o->o_port);
+    printf("  \"threads\": %d,\n", nworkers);
+    if (o->o_duration > 0)
+        printf("  \"duration_s\": %.3f,\n", elapsed_ms / 1e3);
+    printf("  \"ok\": %ld,\n", total_ok);
+    printf("  \"fail\": %ld,\n", fail_tcp + fail_probe + fail_hs + fail_rpc);
+    printf("  \"fail_breakdown\": { \"tcp\": %ld, \"probe\": %ld, "
+           "\"handshake\": %ld, \"rpc\": %ld },\n",
+           fail_tcp, fail_probe, fail_hs, fail_rpc);
+    printf("  \"sessions\": { \"resumed\": %ld, \"full_handshake\": %ld },\n",
+           resumed, full_hs);
+
+    if (total > 0) {
+        struct pct_result pr_total, pr_tcp, pr_probe, pr_hs, pr_rpc;
+        pct_compute(ms_total, total, sum_total, &pr_total);
+        pct_compute(ms_tcp,   total, sum_tcp,   &pr_tcp);
+        pct_compute(ms_probe, total, sum_probe, &pr_probe);
+        pct_compute(ms_hs,    total, sum_hs,    &pr_hs);
+        if (have_rpc)
+            pct_compute(ms_rpc, total, sum_rpc, &pr_rpc);
+
+        printf("  \"phases_ms\": {\n");
+        print_pct_json("tcp",       &pr_tcp,   0);
+        print_pct_json("probe",     &pr_probe, 0);
+        print_pct_json("handshake", &pr_hs,    have_rpc ? 0 : 1);
+        if (have_rpc)
+            print_pct_json("rpc",   &pr_rpc,   0);
+        print_pct_json("total",     &pr_total, 1);
+        printf("  }\n");
+    } else {
+        printf("  \"phases_ms\": {}\n");
+    }
+
+    printf("}\n");
+
+    free(ms_total); free(ms_tcp); free(ms_probe); free(ms_hs); free(ms_rpc);
+}
+
 /* --- main --- */
 
 int main(int argc, char **argv)
@@ -799,12 +962,17 @@ int main(int argc, char **argv)
     if (o.o_snapshot_stats)
         tls_stat_snapshot(&ts_after);
 
-    /* Print final report */
-    print_report(&o, workers, nworkers, elapsed_ms);
+    /* Print final report (text or JSON) */
+    if (o.o_json)
+        print_report_json(&o, workers, nworkers, elapsed_ms);
+    else
+        print_report(&o, workers, nworkers, elapsed_ms);
 
-    /* Print kTLS counter deltas if requested */
+    /* Print kTLS counter deltas if requested.  Suppressed in JSON mode
+     * since the deltas would break the single-object JSON contract;
+     * the JSON consumer can read /proc/net/tls_stat itself if needed. */
     int ktls_errors = 0;
-    if (o.o_snapshot_stats)
+    if (o.o_snapshot_stats && !o.o_json)
         ktls_errors = tls_stat_diff_print(&ts_before, &ts_after);
 
     /* Non-zero exit if any failures -- read before freeing workers */
