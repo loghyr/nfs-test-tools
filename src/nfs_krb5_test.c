@@ -486,7 +486,7 @@ static int krb5_emit_gss_failure(const char *operation,
 }
 
 /* -----------------------------------------------------------------------
- * Option parsing
+ * Option definitions (forward here so probe_secinfo() can use them)
  * --------------------------------------------------------------------- */
 
 struct options {
@@ -498,9 +498,495 @@ struct options {
     int         o_diagnose;          /* run pre-flight checks and exit */
     int         o_print_error_table; /* dump krb5 error taxonomy and exit */
     int         o_stress;            /* run all iterations, count per code */
+    int         o_probe_secinfo;     /* run SECINFO probe and exit */
     const char *o_krb5_trace;        /* path for KRB5_TRACE; NULL = off */
     uint32_t    o_sec;               /* RPCSEC_GSS_SVC_NONE/INTEG/PRIV */
 };
+
+/* -----------------------------------------------------------------------
+ * NFSv4 COMPOUND / SECINFO probe
+ *
+ * Implements a two-step security probe:
+ *   1. COMPOUND(AUTH_SYS, minorversion=0): PUTROOTFH
+ *      -> NFS4_OK   : server accepts AUTH_SYS at the root
+ *      -> WRONGSEC  : server requires a different flavor
+ *   2. COMPOUND(AUTH_SYS, minorversion=1): PUTROOTFH + SECINFO_NO_NAME
+ *      -> parse secinfo4<> list to find what flavors are offered
+ *      -> check if the requested --sec flavor is present
+ *
+ * SECINFO / SECINFO_NO_NAME are special: the server MUST NOT return
+ * NFS4ERR_WRONGSEC for them (RFC 8881 S18.30.5 / RFC 5661 S18.45.5).
+ * We can therefore send the SECINFO probe with plain AUTH_SYS even when
+ * the server requires Kerberos for all other operations.
+ *
+ * NFSv4 wire constants used here:
+ * --------------------------------------------------------------------- */
+
+/* NFSv4 procedure number inside the RPC program */
+#define NFS4_PROC_COMPOUND      1u
+
+/* NFSv4 operation codes (RFC 8881 Table 5) */
+#define OP_PUTROOTFH            24u
+#define OP_SECINFO              33u
+#define OP_SECINFO_NO_NAME      51u   /* NFSv4.1+ (RFC 5661 S18.45) */
+
+/* secinfo_style4 values (RFC 5661 S18.45) */
+#define SECINFO_STYLE4_CURRENT_FH   0u
+#define SECINFO_STYLE4_PARENT       1u
+
+/* NFS4 status codes (RFC 8881 Table 6) */
+#define NFS4_OK                 0u
+#define NFS4ERR_WRONGSEC        10009u
+#define NFS4ERR_OP_NOT_IN_SESSION 10044u
+
+/*
+ * build_authsys_compound -- build a bare NFSv4 COMPOUND with an AUTH_SYS
+ * credential over TCP.  The credential uses uid=65534, gid=65534 (nobody)
+ * so the probe never accidentally gains real server access.
+ *
+ * The COMPOUND args are supplied by the caller in cmpd_body/cmpd_len.
+ * Returns total byte count including the TCP record marker, or 0 on
+ * buffer overflow.
+ */
+static size_t build_authsys_compound(uint8_t *buf, size_t bufsz,
+                                      uint32_t xid,
+                                      const uint8_t *cmpd_body,
+                                      size_t cmpd_len)
+{
+	/*
+	 * AUTH_SYS body (RFC 5531 S8.1):
+	 *   stamp(4) + machinename_len(4) [+pad] + uid(4) + gid(4) + gids_len(4)
+	 * Empty machinename ("") is 4 bytes of length=0 with no data/padding.
+	 */
+	const uint32_t authsys_len = 20u;   /* 5 * 4 bytes */
+	size_t pos = 0;
+
+	/* TCP record marker -- filled in at the end */
+	size_t marker_pos = pos;
+	if (!rpc_put_u32(buf, bufsz, &pos, 0u))         return 0;
+
+	/* RPC call header */
+	if (!rpc_put_u32(buf, bufsz, &pos, xid))         return 0;
+	if (!rpc_put_u32(buf, bufsz, &pos, RPC_CALL))    return 0;
+	if (!rpc_put_u32(buf, bufsz, &pos, 2u))          return 0; /* rpcvers */
+	if (!rpc_put_u32(buf, bufsz, &pos, NFS_PROGRAM)) return 0;
+	if (!rpc_put_u32(buf, bufsz, &pos, NFS_VERSION_4)) return 0;
+	if (!rpc_put_u32(buf, bufsz, &pos, NFS4_PROC_COMPOUND)) return 0;
+
+	/* AUTH_SYS credential */
+	if (!rpc_put_u32(buf, bufsz, &pos, RPC_AUTH_SYS))  return 0;
+	if (!rpc_put_u32(buf, bufsz, &pos, authsys_len))    return 0;
+	if (!rpc_put_u32(buf, bufsz, &pos, 0x12345678u))    return 0; /* stamp */
+	if (!rpc_put_u32(buf, bufsz, &pos, 0u))             return 0; /* machinename="" */
+	if (!rpc_put_u32(buf, bufsz, &pos, 65534u))         return 0; /* uid=nobody */
+	if (!rpc_put_u32(buf, bufsz, &pos, 65534u))         return 0; /* gid=nogroup */
+	if (!rpc_put_u32(buf, bufsz, &pos, 0u))             return 0; /* gids count */
+
+	/* AUTH_NONE verifier */
+	if (!rpc_put_u32(buf, bufsz, &pos, RPC_AUTH_NONE)) return 0;
+	if (!rpc_put_u32(buf, bufsz, &pos, 0u))            return 0;
+
+	/* COMPOUND args body */
+	if (pos + cmpd_len > bufsz)
+		return 0;
+	memcpy(buf + pos, cmpd_body, cmpd_len);
+	pos += cmpd_len;
+
+	/* Fill in record marker */
+	uint32_t body_bytes = (uint32_t)(pos - 4);
+	size_t mpos = marker_pos;
+	rpc_put_u32(buf, bufsz, &mpos, RPC_LAST_FRAG | body_bytes);
+
+	return pos;
+}
+
+/*
+ * parse_nfs4_compound_hdr -- parse a COMPOUND4res reply header.
+ *
+ * On return, *pos is positioned at the first op result in resarray.
+ * *nops is the resarray count.  Returns 0 on success, -1 on error.
+ */
+static int parse_nfs4_compound_hdr(const uint8_t *body, size_t body_len,
+                                    uint32_t expected_xid,
+                                    uint32_t *compound_status,
+                                    size_t *pos, uint32_t *nops,
+                                    char *errbuf, size_t errsz)
+{
+	uint32_t xid, msg_type, reply_stat;
+	uint32_t verf_flavor, verf_len;
+	uint32_t accept_stat;
+	uint32_t tag_len;
+
+	*pos = 0;
+
+	if (!rpc_get_u32(body, body_len, pos, &xid) ||
+	    !rpc_get_u32(body, body_len, pos, &msg_type) ||
+	    !rpc_get_u32(body, body_len, pos, &reply_stat)) {
+		snprintf(errbuf, errsz, "COMPOUND reply: short header");
+		return -1;
+	}
+	if (xid != expected_xid) {
+		snprintf(errbuf, errsz, "COMPOUND reply: xid mismatch "
+		         "(got %u want %u)", xid, expected_xid);
+		return -1;
+	}
+	if (msg_type != RPC_REPLY || reply_stat != RPC_MSG_ACCEPTED) {
+		snprintf(errbuf, errsz, "COMPOUND reply: msg rejected "
+		         "msg_type=%u reply_stat=%u", msg_type, reply_stat);
+		return -1;
+	}
+
+	/* verifier */
+	if (!rpc_get_u32(body, body_len, pos, &verf_flavor) ||
+	    !rpc_get_u32(body, body_len, pos, &verf_len)) {
+		snprintf(errbuf, errsz, "COMPOUND reply: short verifier");
+		return -1;
+	}
+	uint32_t verf_padded = (verf_len + 3u) & ~3u;
+	if (!rpc_skip(body_len, pos, verf_padded)) {
+		snprintf(errbuf, errsz, "COMPOUND reply: verifier body truncated");
+		return -1;
+	}
+
+	if (!rpc_get_u32(body, body_len, pos, &accept_stat)) {
+		snprintf(errbuf, errsz, "COMPOUND reply: no accept_stat");
+		return -1;
+	}
+	if (accept_stat != RPC_SUCCESS) {
+		snprintf(errbuf, errsz, "COMPOUND reply: accept_stat=%u", accept_stat);
+		return -1;
+	}
+
+	/* COMPOUND4res: status + tag + resarray */
+	if (!rpc_get_u32(body, body_len, pos, compound_status)) {
+		snprintf(errbuf, errsz, "COMPOUND4res: no status");
+		return -1;
+	}
+	if (!rpc_get_u32(body, body_len, pos, &tag_len)) {
+		snprintf(errbuf, errsz, "COMPOUND4res: no tag_len");
+		return -1;
+	}
+	uint32_t tag_padded = (tag_len + 3u) & ~3u;
+	if (!rpc_skip(body_len, pos, tag_padded)) {
+		snprintf(errbuf, errsz, "COMPOUND4res: tag truncated");
+		return -1;
+	}
+	if (!rpc_get_u32(body, body_len, pos, nops)) {
+		snprintf(errbuf, errsz, "COMPOUND4res: no resarray count");
+		return -1;
+	}
+	return 0;
+}
+
+/*
+ * gss_service_name -- map secinfo service value to a human-readable label.
+ */
+static const char *gss_service_name(uint32_t service)
+{
+	if (service == RPCSEC_GSS_SVC_NONE)  return "krb5";
+	if (service == RPCSEC_GSS_SVC_INTEG) return "krb5i";
+	if (service == RPCSEC_GSS_SVC_PRIV)  return "krb5p";
+	return "unknown";
+}
+
+/*
+ * parse_and_print_secinfo -- consume and print a secinfo4<> array from the
+ * body at *pos.  The array describes what security flavors the server
+ * accepts for the current file handle.
+ *
+ * Also checks whether the caller's requested service (want_svc =
+ * RPCSEC_GSS_SVC_*) appears in the list and returns:
+ *   0  : flavor found
+ *   1  : secinfo array is empty
+ *   2  : secinfo non-empty but our flavor is absent (WRONGSEC condition)
+ *  -1  : parse error
+ */
+static int parse_and_print_secinfo(const uint8_t *body, size_t body_len,
+                                    size_t *pos, uint32_t want_svc,
+                                    char *errbuf, size_t errsz)
+{
+	uint32_t count;
+	if (!rpc_get_u32(body, body_len, pos, &count)) {
+		snprintf(errbuf, errsz, "secinfo4: no count");
+		return -1;
+	}
+	if (count == 0) {
+		printf("    (empty secinfo list)\n");
+		return 1;
+	}
+
+	int found = 0;
+	for (uint32_t i = 0; i < count; i++) {
+		uint32_t flavor;
+		if (!rpc_get_u32(body, body_len, pos, &flavor)) {
+			snprintf(errbuf, errsz,
+			         "secinfo4[%u]: no flavor", i);
+			return -1;
+		}
+
+		if (flavor == RPCSEC_GSS) {
+			/* rpcsec_gss_info: oid<> + qop + service */
+			uint32_t oid_len;
+			if (!rpc_get_u32(body, body_len, pos, &oid_len)) {
+				snprintf(errbuf, errsz,
+				         "secinfo4[%u]: RPCSEC_GSS no oid_len", i);
+				return -1;
+			}
+			uint32_t oid_padded = (oid_len + 3u) & ~3u;
+			if (!rpc_skip(body_len, pos, oid_padded)) {
+				snprintf(errbuf, errsz,
+				         "secinfo4[%u]: RPCSEC_GSS oid truncated", i);
+				return -1;
+			}
+			uint32_t qop, service;
+			if (!rpc_get_u32(body, body_len, pos, &qop) ||
+			    !rpc_get_u32(body, body_len, pos, &service)) {
+				snprintf(errbuf, errsz,
+				         "secinfo4[%u]: RPCSEC_GSS short qop/service",
+				         i);
+				return -1;
+			}
+			printf("    [%u] RPCSEC_GSS (Kerberos5 oid_len=%u qop=%u"
+			       " service=%s)\n",
+			       i, oid_len, qop, gss_service_name(service));
+			if (service == want_svc)
+				found = 1;
+		} else if (flavor == RPC_AUTH_SYS) {
+			printf("    [%u] AUTH_SYS\n", i);
+		} else if (flavor == RPC_AUTH_NONE) {
+			printf("    [%u] AUTH_NONE\n", i);
+		} else {
+			printf("    [%u] flavor=%u (unknown)\n", i, flavor);
+		}
+	}
+
+	return found ? 0 : 2;
+}
+
+/*
+ * probe_secinfo -- run the two-step SECINFO probe against opts->o_host.
+ *
+ * Step 1: Send COMPOUND(AUTH_SYS, minorversion=0): PUTROOTFH
+ *         Report whether AUTH_SYS is accepted.
+ *
+ * Step 2: Send COMPOUND(AUTH_SYS, minorversion=1): PUTROOTFH + SECINFO_NO_NAME
+ *         Parse and print the secinfo4<> list.
+ *         Emit KRB5_ERR_WRONGSEC if our --sec flavor is not offered.
+ *         Emit KRB5_ERR_SECINFO_EMPTY if the server returns an empty list.
+ *
+ * Returns NFS_ERR_OK, KRB5_ERR_WRONGSEC, or KRB5_ERR_SECINFO_EMPTY.
+ */
+static int probe_secinfo(const struct options *opts)
+{
+	char errbuf[512];
+	uint8_t call_buf[RPC_MSG_MAX];
+	uint8_t reply_buf[RPC_MSG_MAX];
+	uint32_t xid = (uint32_t)getpid() + 0x500u;
+
+	printf("probe-secinfo: %s:%s\n", opts->o_host, opts->o_port);
+
+	int probe_fd = tcp_connect_host(opts->o_host, opts->o_port,
+	                                errbuf, sizeof(errbuf));
+	if (probe_fd < 0) {
+		fprintf(stderr, "probe-secinfo: connect: %s\n", errbuf);
+		return NFS_ERR_INTERNAL;
+	}
+
+	/* ------------------------------------------------------------------
+	 * Step 1: AUTH_SYS COMPOUND(minorversion=0): PUTROOTFH
+	 * ------------------------------------------------------------------ */
+
+	/* Build COMPOUND args: tag="" + minorversion=0 + 1 op (PUTROOTFH) */
+	uint8_t cmpd1[16];
+	size_t cp = 0;
+	rpc_put_u32(cmpd1, sizeof(cmpd1), &cp, 0u);   /* tag_len=0 */
+	rpc_put_u32(cmpd1, sizeof(cmpd1), &cp, 0u);   /* minorversion=0 */
+	rpc_put_u32(cmpd1, sizeof(cmpd1), &cp, 1u);   /* argarray count=1 */
+	rpc_put_u32(cmpd1, sizeof(cmpd1), &cp, OP_PUTROOTFH); /* op, no args */
+
+	xid++;
+	size_t call_len = build_authsys_compound(call_buf, sizeof(call_buf),
+	                                          xid, cmpd1, cp);
+	if (call_len == 0) {
+		fprintf(stderr, "probe-secinfo: call buffer overflow\n");
+		close(probe_fd);
+		return NFS_ERR_INTERNAL;
+	}
+
+	if (rpc_writen(probe_fd, call_buf, call_len) != (ssize_t)call_len) {
+		fprintf(stderr, "probe-secinfo: write step1: %s\n",
+		        strerror(errno));
+		close(probe_fd);
+		return NFS_ERR_INTERNAL;
+	}
+
+	ssize_t rlen = read_rpc_reply(probe_fd, reply_buf, sizeof(reply_buf),
+	                               errbuf, sizeof(errbuf));
+	if (rlen < 0) {
+		fprintf(stderr, "probe-secinfo: read step1: %s\n", errbuf);
+		close(probe_fd);
+		return NFS_ERR_INTERNAL;
+	}
+
+	{
+		uint32_t cmpd_status;
+		size_t rpos;
+		uint32_t nops;
+		if (parse_nfs4_compound_hdr(reply_buf, (size_t)rlen, xid,
+		                             &cmpd_status, &rpos, &nops,
+		                             errbuf, sizeof(errbuf)) < 0) {
+			fprintf(stderr, "probe-secinfo: step1 parse: %s\n",
+			        errbuf);
+			close(probe_fd);
+			return NFS_ERR_INTERNAL;
+		}
+
+		if (cmpd_status == NFS4_OK) {
+			printf("  AUTH_SYS probe: NFS4_OK "
+			       "(server accepts AUTH_SYS at root)\n");
+		} else if (cmpd_status == NFS4ERR_WRONGSEC) {
+			printf("  AUTH_SYS probe: NFS4ERR_WRONGSEC "
+			       "(server requires a different flavor)\n");
+		} else {
+			printf("  AUTH_SYS probe: status=%u\n", cmpd_status);
+		}
+	}
+
+	/* ------------------------------------------------------------------
+	 * Step 2: AUTH_SYS COMPOUND(minorversion=1): PUTROOTFH + SECINFO_NO_NAME
+	 *
+	 * Per RFC 5661 S18.45.5: SECINFO_NO_NAME MUST NOT return
+	 * NFS4ERR_WRONGSEC, so AUTH_SYS is accepted even when Kerberos is
+	 * required for all other operations.
+	 * ------------------------------------------------------------------ */
+
+	/* Build COMPOUND args: tag="" + minorversion=1 + 2 ops */
+	uint8_t cmpd2[28];
+	size_t cp2 = 0;
+	rpc_put_u32(cmpd2, sizeof(cmpd2), &cp2, 0u);   /* tag_len=0 */
+	rpc_put_u32(cmpd2, sizeof(cmpd2), &cp2, 1u);   /* minorversion=1 */
+	rpc_put_u32(cmpd2, sizeof(cmpd2), &cp2, 2u);   /* argarray count=2 */
+	rpc_put_u32(cmpd2, sizeof(cmpd2), &cp2, OP_PUTROOTFH);
+	rpc_put_u32(cmpd2, sizeof(cmpd2), &cp2, OP_SECINFO_NO_NAME);
+	rpc_put_u32(cmpd2, sizeof(cmpd2), &cp2, SECINFO_STYLE4_CURRENT_FH);
+
+	xid++;
+	call_len = build_authsys_compound(call_buf, sizeof(call_buf),
+	                                   xid, cmpd2, cp2);
+	if (call_len == 0) {
+		fprintf(stderr, "probe-secinfo: call2 buffer overflow\n");
+		close(probe_fd);
+		return NFS_ERR_INTERNAL;
+	}
+
+	if (rpc_writen(probe_fd, call_buf, call_len) != (ssize_t)call_len) {
+		fprintf(stderr, "probe-secinfo: write step2: %s\n",
+		        strerror(errno));
+		close(probe_fd);
+		return NFS_ERR_INTERNAL;
+	}
+
+	rlen = read_rpc_reply(probe_fd, reply_buf, sizeof(reply_buf),
+	                       errbuf, sizeof(errbuf));
+	if (rlen < 0) {
+		fprintf(stderr, "probe-secinfo: read step2: %s\n", errbuf);
+		close(probe_fd);
+		return NFS_ERR_INTERNAL;
+	}
+
+	close(probe_fd);
+
+	uint32_t cmpd_status;
+	size_t rpos;
+	uint32_t nops;
+	if (parse_nfs4_compound_hdr(reply_buf, (size_t)rlen, xid,
+	                             &cmpd_status, &rpos, &nops,
+	                             errbuf, sizeof(errbuf)) < 0) {
+		fprintf(stderr, "probe-secinfo: step2 parse: %s\n", errbuf);
+		return NFS_ERR_INTERNAL;
+	}
+
+	if (cmpd_status != NFS4_OK && cmpd_status != NFS4ERR_WRONGSEC) {
+		/*
+		 * Server may return OP_NOT_IN_SESSION (10044) if it strictly
+		 * requires a SEQUENCE before PUTROOTFH in NFSv4.1.  Report
+		 * the raw code so the user knows why SECINFO failed.
+		 */
+		printf("  SECINFO_NO_NAME: COMPOUND status=%u "
+		       "(server may require NFSv4.1 session)\n",
+		       cmpd_status);
+		return NFS_ERR_INTERNAL;
+	}
+
+	/*
+	 * Walk the resarray to find the SECINFO_NO_NAME result.
+	 * Each element: opcode(4) + status(4) [+ op-specific result if OK]
+	 */
+	printf("  SECINFO_NO_NAME reply:\n");
+
+	int sec_result = 1; /* assume empty until proven otherwise */
+	for (uint32_t i = 0; i < nops; i++) {
+		uint32_t op_code, op_status;
+		if (!rpc_get_u32(reply_buf, (size_t)rlen, &rpos, &op_code) ||
+		    !rpc_get_u32(reply_buf, (size_t)rlen, &rpos, &op_status)) {
+			fprintf(stderr, "probe-secinfo: resarray[%u] truncated\n",
+			        i);
+			return NFS_ERR_INTERNAL;
+		}
+		if (op_code == OP_PUTROOTFH) {
+			if (op_status != NFS4_OK) {
+				printf("  PUTROOTFH: failed status=%u\n",
+				       op_status);
+				return NFS_ERR_INTERNAL;
+			}
+			/* no result body for PUTROOTFH */
+		} else if (op_code == OP_SECINFO_NO_NAME) {
+			if (op_status != NFS4_OK) {
+				printf("  SECINFO_NO_NAME: op_status=%u\n",
+				       op_status);
+				return NFS_ERR_INTERNAL;
+			}
+			sec_result = parse_and_print_secinfo(
+			    reply_buf, (size_t)rlen, &rpos,
+			    opts->o_sec, errbuf, sizeof(errbuf));
+			if (sec_result < 0) {
+				fprintf(stderr, "probe-secinfo: secinfo parse: %s\n",
+				        errbuf);
+				return NFS_ERR_INTERNAL;
+			}
+		} else {
+			/* unexpected op in reply -- skip and continue */
+			if (op_status != NFS4_OK)
+				break;
+		}
+	}
+
+	const char *want_label = (opts->o_sec == RPCSEC_GSS_SVC_NONE)  ? "krb5"
+	                        : (opts->o_sec == RPCSEC_GSS_SVC_INTEG) ? "krb5i"
+	                                                                 : "krb5p";
+	if (sec_result == 0) {
+		printf("  Requested --sec %s: FOUND in SECINFO list\n",
+		       want_label);
+		return NFS_ERR_OK;
+	} else if (sec_result == 1) {
+		printf("  Requested --sec %s: secinfo list empty\n", want_label);
+		nfs_error_emit_one(stderr, KRB5_ERR_SECINFO_EMPTY,
+		                   "server returned empty SECINFO list");
+		return KRB5_ERR_SECINFO_EMPTY;
+	} else {
+		printf("  Requested --sec %s: NOT FOUND in SECINFO list\n",
+		       want_label);
+		char ctx[128];
+		snprintf(ctx, sizeof(ctx),
+		         "%s not in server's SECINFO list for root", want_label);
+		nfs_error_emit_one(stderr, KRB5_ERR_WRONGSEC, ctx);
+		return KRB5_ERR_WRONGSEC;
+	}
+}
+
+/* -----------------------------------------------------------------------
+ * Option parsing
+ * --------------------------------------------------------------------- */
 
 static void usage(const char *prog)
 {
@@ -518,6 +1004,13 @@ static void usage(const char *prog)
             "                        krb5  -- auth only (SVC_NONE)\n"
             "                        krb5i -- integrity (SVC_INTEG, MIC over args)\n"
             "                        krb5p -- privacy   (SVC_PRIV, gss_wrap of args)\n"
+            "  --probe-secinfo       Connect to --host and run a two-step SECINFO\n"
+            "                        probe (AUTH_SYS COMPOUND): step 1 checks\n"
+            "                        if AUTH_SYS is accepted at the root;\n"
+            "                        step 2 sends PUTROOTFH + SECINFO_NO_NAME\n"
+            "                        and reports what flavors the server\n"
+            "                        advertises and whether --sec is present.\n"
+            "                        Exits without attempting Kerberos setup.\n"
             "  --stress              Run all iterations even after failures,\n"
             "                        count by symbolic error code, and report\n"
             "                        per-code totals at the end.  Useful for\n"
@@ -575,6 +1068,7 @@ static void parse_options(int argc, char **argv, struct options *o)
         { "diagnose",         no_argument,       NULL, 'D' },
         { "print-error-table",no_argument,       NULL, 'E' },
         { "krb5-trace",       required_argument, NULL, 'T' },
+        { "probe-secinfo",    no_argument,       NULL, 'Q' },
         { NULL, 0, NULL, 0 }
     };
 
@@ -596,6 +1090,7 @@ static void parse_options(int argc, char **argv, struct options *o)
         case 'D': o->o_diagnose         = 1;            break;
         case 'E': o->o_print_error_table = 1;           break;
         case 'T': o->o_krb5_trace       = optarg;       break;
+        case 'Q': o->o_probe_secinfo    = 1;            break;
         default:  usage(argv[0]);
         }
     }
@@ -670,6 +1165,12 @@ int main(int argc, char **argv)
         nfs_error_print_table("krb5");
         return NFS_ERR_OK;
     }
+
+    /* --probe-secinfo: run the NFSv4 SECINFO probe and exit without
+     * attempting Kerberos context setup.  Useful for diagnosing
+     * NFS4ERR_WRONGSEC failures before committing a Kerberos ticket. */
+    if (opts.o_probe_secinfo)
+        return probe_secinfo(&opts);
 
     /* Build default principal "nfs@HOST" if not specified */
     char default_principal[512];
