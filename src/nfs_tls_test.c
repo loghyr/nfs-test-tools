@@ -35,6 +35,7 @@
 #include "stats.h"
 #include "tls_stat.h"
 #include "diagnose.h"
+#include "tls_error.h"
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -78,6 +79,7 @@ struct options {
     int         o_require_tls13;   /* 1 = treat TLS 1.2 as FAIL not WARN */
     const char *o_require_alpn;    /* required ALPN protocol, or NULL */
     int         o_json;            /* 1 = emit JSON-only report on stdout */
+    int         o_print_error_table; /* 1 = dump error taxonomy and exit */
 };
 
 /* --- per-worker state --- */
@@ -413,6 +415,7 @@ static void usage(const char *prog)
         "\n"
         "Diagnostic and strict-mode options:\n"
         "  --diagnose            Run local pre-flight checks and exit\n"
+        "  --print-error-table   Print the canonical error taxonomy and exit\n"
         "  --keylog FILE         Write NSS-format TLS key log for Wireshark\n"
         "  --check-san LIST      Verify server cert SAN includes these entries\n"
         "                        (comma-separated 'IP:...,DNS:...')\n"
@@ -451,6 +454,7 @@ static void parse_options(int argc, char **argv, struct options *o)
         { "require-tls13",    no_argument,       NULL, '3' },
         { "require-alpn",     required_argument, NULL, 'N' },
         { "output",           required_argument, NULL, 'O' },
+        { "print-error-table",no_argument,       NULL, 'E' },
         { NULL, 0, NULL, 0 }
     };
 
@@ -496,13 +500,14 @@ static void parse_options(int argc, char **argv, struct options *o)
                 usage(argv[0]);
             }
             break;
+        case 'E': o->o_print_error_table = 1; break;
         default:
             usage(argv[0]);
         }
     }
 
-    /* --diagnose runs without a host */
-    if (o->o_diagnose)
+    /* --diagnose and --print-error-table run without a host */
+    if (o->o_diagnose || o->o_print_error_table)
         return;
 
     if (!o->o_host) {
@@ -841,6 +846,12 @@ int main(int argc, char **argv)
     /* --diagnose: run pre-flight checks and exit before anything else */
     if (o.o_diagnose)
         return diagnose_run();
+
+    /* --print-error-table: dump the canonical taxonomy and exit */
+    if (o.o_print_error_table) {
+        tls_error_print_table();
+        return EXIT_SUCCESS;
+    }
 
     SSL_CTX *ctx = tls_ctx_create(o.o_ca_cert, o.o_cert, o.o_key);
     if (!ctx) {
