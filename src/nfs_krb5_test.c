@@ -921,6 +921,7 @@ struct options {
     int         o_verbose;
     int         o_diagnose;          /* run pre-flight checks and exit */
     int         o_print_error_table; /* dump krb5 error taxonomy and exit */
+    int         o_stress;            /* run all iterations, count per code */
     uint32_t    o_sec;               /* RPCSEC_GSS_SVC_NONE/INTEG/PRIV */
 };
 
@@ -940,6 +941,12 @@ static void usage(const char *prog)
             "                        krb5  -- auth only (SVC_NONE)\n"
             "                        krb5i -- integrity (SVC_INTEG, MIC over args)\n"
             "                        krb5p -- privacy   (SVC_PRIV, gss_wrap of args)\n"
+            "  --stress              Run all iterations even after failures,\n"
+            "                        count by symbolic error code, and report\n"
+            "                        per-code totals at the end.  Useful for\n"
+            "                        finding intermittent server-side bugs and\n"
+            "                        for hammering the RPCSEC_GSS replay cache\n"
+            "                        with a churning seq_num on a single context.\n"
             "  --verbose             Show GSS exchange details\n"
             "\n"
             "Diagnostic options:\n"
@@ -980,6 +987,7 @@ static void parse_options(int argc, char **argv, struct options *o)
         { "principal",        required_argument, NULL, 'P' },
         { "iterations",       required_argument, NULL, 'i' },
         { "sec",              required_argument, NULL, 'S' },
+        { "stress",           no_argument,       NULL, 's' },
         { "verbose",          no_argument,       NULL, 'v' },
         { "diagnose",         no_argument,       NULL, 'D' },
         { "print-error-table",no_argument,       NULL, 'E' },
@@ -999,6 +1007,7 @@ static void parse_options(int argc, char **argv, struct options *o)
         case 'P': o->o_principal        = optarg;       break;
         case 'i': o->o_iterations       = atol(optarg); break;
         case 'S': o->o_sec = parse_sec_flavor(optarg, argv[0]); break;
+        case 's': o->o_stress           = 1;            break;
         case 'v': o->o_verbose          = 1;            break;
         case 'D': o->o_diagnose         = 1;            break;
         case 'E': o->o_print_error_table = 1;           break;
@@ -1211,59 +1220,128 @@ int main(int argc, char **argv)
 
     /* --- DATA NULL calls ---
      *
-     * Track the canonical exit code: NFS_ERR_OK on full success, the
-     * symbolic code of the failing iteration otherwise.  We bail on
-     * the first failure (single-threaded sequential test), so MIXED
-     * is not currently reachable here -- but we keep the variable
-     * shape consistent with nfs_tls_test for future stress mode.
+     * Two modes:
+     *
+     *   Default (no --stress): bail on the first failure and exit
+     *   with that failure's symbolic code.  Best for one-shot
+     *   diagnostic runs.
+     *
+     *   --stress: keep iterating regardless of failures.  Track
+     *   per-code counts in stress_fail_by_code[] (krb5 codes 100..199
+     *   indexed offset-100; everything else accumulates in
+     *   stress_fail_internal).  After the loop, emit one [ERROR
+     *   SYMBOL] block per non-zero code and compute the canonical
+     *   exit code: NFS_ERR_OK if no failures, the single dominant
+     *   krb5 code if exactly one class failed, NFS_ERR_MIXED if more
+     *   than one.  Useful for catching intermittent server-side bugs
+     *   and replay-cache thrash where seq_num churn under load
+     *   surfaces RPCSEC_REPLAY or RPCSEC_CTXPROBLEM after some N
+     *   successful calls.
      */
     int result_code = NFS_ERR_OK;
+    long stress_ok = 0;
+    long stress_fail_internal = 0;
+    long stress_fail_by_code[100] = { 0 };  /* index = code - 100 */
+
     for (long i = 0; i < opts.o_iterations; i++) {
         xid++;
+        int iter_code = NFS_ERR_OK;
+
         size_t call_len = build_gss_data_null(call_buf, sizeof(call_buf),
                                                xid, NFS_PROGRAM, NFS_VERSION_4,
                                                &gc, opts.o_sec,
                                                errbuf, sizeof(errbuf));
         if (call_len == 0) {
-            /* gss_get_mic / gss_wrap over the call body failed --
-             * typically a dead context. */
-            nfs_error_emit_one(stderr, KRB5_ERR_GSS_CONTEXT_EXPIRED,
-                               errbuf);
-            result_code = KRB5_ERR_GSS_CONTEXT_EXPIRED;
-            break;
+            iter_code = KRB5_ERR_GSS_CONTEXT_EXPIRED;
+            goto record;
         }
         if (rpc_writen(fd, call_buf, call_len) != (ssize_t)call_len) {
-            fprintf(stderr, "write DATA NULL: %s\n", strerror(errno));
-            result_code = NFS_ERR_INTERNAL;
-            break;
+            snprintf(errbuf, sizeof(errbuf),
+                     "write DATA NULL: %s", strerror(errno));
+            iter_code = NFS_ERR_INTERNAL;
+            goto record;
         }
 
         ssize_t rlen = read_rpc_reply(fd, reply_buf, sizeof(reply_buf),
                                        errbuf, sizeof(errbuf));
         if (rlen < 0) {
-            /* Server dropped the connection or returned a structured
-             * RPCSEC_GSS reject mid-stream -- the most common cause
-             * is RPCSEC_GSS_CTXPROBLEM under load.  Use that as the
-             * default classification. */
-            nfs_error_emit_one(stderr, KRB5_ERR_RPCSEC_CTXPROBLEM,
-                               errbuf);
-            result_code = KRB5_ERR_RPCSEC_CTXPROBLEM;
-            break;
+            iter_code = KRB5_ERR_RPCSEC_CTXPROBLEM;
+            goto record;
         }
         if (parse_data_reply_verifier(reply_buf, (size_t)rlen, xid,
                                        &gc, opts.o_sec,
                                        errbuf, sizeof(errbuf)) < 0) {
-            /* Reply verifier (server's MIC) failed gss_verify_mic --
-             * either the server's MIC is bad or our context state
-             * has drifted. */
-            nfs_error_emit_one(stderr, KRB5_ERR_GSS_BAD_MIC, errbuf);
-            result_code = KRB5_ERR_GSS_BAD_MIC;
-            break;
+            iter_code = KRB5_ERR_GSS_BAD_MIC;
+            goto record;
         }
+
+        /* Success */
+        stress_ok++;
         if (opts.o_verbose)
             printf("  DATA NULL [%ld]: OK (seq=%u)\n", i + 1, gc.gc_seq_num);
-        else
+        else if (!opts.o_stress)
             printf("  NULL call %ld/%ld OK\n", i + 1, opts.o_iterations);
+        continue;
+
+record:
+        if (iter_code >= 100 && iter_code < 200)
+            stress_fail_by_code[iter_code - 100]++;
+        else
+            stress_fail_internal++;
+
+        if (!opts.o_stress) {
+            /* Default mode: emit immediately and bail. */
+            nfs_error_emit_one(stderr, iter_code, errbuf);
+            result_code = iter_code;
+            break;
+        }
+        /* Stress mode: silently accumulate; the per-code summary
+         * gets emitted after the loop.  Print one short progress
+         * line per failure for visibility. */
+        if (opts.o_verbose)
+            fprintf(stderr, "  iter %ld: code=%d %s\n",
+                    i + 1, iter_code, errbuf);
+    }
+
+    /*
+     * Stress mode: emit per-code [ERROR SYMBOL] blocks and compute
+     * the canonical aggregate exit code.  Skipped in default mode
+     * (which already set result_code on the first failure above).
+     */
+    if (opts.o_stress) {
+        printf("\nstress: %ld attempts, %ld ok\n",
+               (long)opts.o_iterations, stress_ok);
+        int distinct = 0;
+        int single_code = NFS_ERR_OK;
+        for (int idx = 0; idx < 100; idx++) {
+            if (stress_fail_by_code[idx] == 0)
+                continue;
+            int code = 100 + idx;
+            char ctx[64];
+            snprintf(ctx, sizeof(ctx),
+                     "%ld stress failure%s",
+                     stress_fail_by_code[idx],
+                     stress_fail_by_code[idx] == 1 ? "" : "s");
+            nfs_error_emit_one(stderr, code, ctx);
+            distinct++;
+            single_code = code;
+        }
+        if (stress_fail_internal > 0) {
+            char ctx[64];
+            snprintf(ctx, sizeof(ctx),
+                     "%ld transport / internal failure%s",
+                     stress_fail_internal,
+                     stress_fail_internal == 1 ? "" : "s");
+            nfs_error_emit_one(stderr, NFS_ERR_INTERNAL, ctx);
+            distinct++;
+            single_code = NFS_ERR_INTERNAL;
+        }
+        if (distinct == 0)
+            result_code = NFS_ERR_OK;
+        else if (distinct == 1)
+            result_code = single_code;
+        else
+            result_code = NFS_ERR_MIXED;
     }
 
     /* --- Cleanup --- */
