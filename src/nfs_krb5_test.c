@@ -922,6 +922,7 @@ struct options {
     int         o_diagnose;          /* run pre-flight checks and exit */
     int         o_print_error_table; /* dump krb5 error taxonomy and exit */
     int         o_stress;            /* run all iterations, count per code */
+    const char *o_krb5_trace;        /* path for KRB5_TRACE; NULL = off */
     uint32_t    o_sec;               /* RPCSEC_GSS_SVC_NONE/INTEG/PRIV */
 };
 
@@ -952,6 +953,12 @@ static void usage(const char *prog)
             "Diagnostic options:\n"
             "  --diagnose            Run local pre-flight krb5 checks and exit\n"
             "  --print-error-table   Print the krb5 error taxonomy and exit\n"
+            "  --krb5-trace FILE     Set KRB5_TRACE to FILE for libkrb5 tracing.\n"
+            "                        Captures THIS process's libkrb5 calls only;\n"
+            "                        will NOT capture rpc.gssd or gssproxy.  For\n"
+            "                        kernel-side traces use:\n"
+            "                          rpcdebug -m rpc -s auth\n"
+            "                          journalctl -u rpc-gssd -f\n"
             "\n"
             "Tests RPCSEC_GSS (RFC 2203) Kerberos 5 context establishment and\n"
             "authenticated NULL RPC calls against an NFS server.  --sec krb5i\n"
@@ -991,6 +998,7 @@ static void parse_options(int argc, char **argv, struct options *o)
         { "verbose",          no_argument,       NULL, 'v' },
         { "diagnose",         no_argument,       NULL, 'D' },
         { "print-error-table",no_argument,       NULL, 'E' },
+        { "krb5-trace",       required_argument, NULL, 'T' },
         { NULL, 0, NULL, 0 }
     };
 
@@ -1011,6 +1019,7 @@ static void parse_options(int argc, char **argv, struct options *o)
         case 'v': o->o_verbose          = 1;            break;
         case 'D': o->o_diagnose         = 1;            break;
         case 'E': o->o_print_error_table = 1;           break;
+        case 'T': o->o_krb5_trace       = optarg;       break;
         default:  usage(argv[0]);
         }
     }
@@ -1037,6 +1046,34 @@ int main(int argc, char **argv)
     /* Register the krb5 error table into the cross-domain registry
      * before any nfs_error_emit_one or nfs_error_lookup is called. */
     krb5_error_init();
+
+    /*
+     * --krb5-trace: enable libkrb5 tracing for THIS process.
+     *
+     * KRB5_TRACE is read by libkrb5 once per process at the first
+     * krb5_init_context() call (which gss_init_sec_context will
+     * indirectly trigger), so it must be set before any GSS-API call.
+     *
+     * This only captures libkrb5 calls made inside this binary.  It
+     * does NOT capture rpc.gssd / gssproxy traces, which run in
+     * separate processes.  When the failure is in the kernel-side
+     * GSS path (mount-time, the daemons answer for the kernel) you
+     * want `rpcdebug -m rpc -s auth` plus `journalctl -u rpc-gssd`
+     * instead of (or in addition to) this flag.
+     *
+     * The file is appended to, not truncated, so multiple runs
+     * accumulate.  Do not delete the file mid-run; libkrb5 keeps an
+     * fd open against it for the life of the process.
+     */
+    if (opts.o_krb5_trace) {
+        if (setenv("KRB5_TRACE", opts.o_krb5_trace, 1) != 0) {
+            fprintf(stderr, "warning: setenv(KRB5_TRACE) failed: %s\n",
+                    strerror(errno));
+        } else if (opts.o_verbose) {
+            printf("krb5 trace: writing libkrb5 trace to %s\n",
+                   opts.o_krb5_trace);
+        }
+    }
 
     /* --diagnose: run pre-flight krb5 checks and exit. */
     if (opts.o_diagnose) {
