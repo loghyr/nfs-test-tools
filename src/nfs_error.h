@@ -47,12 +47,12 @@
  *               the phase section.
  */
 struct nfs_error_info {
-    int          code;
-    int          phase;
-    const char  *symbol;
-    const char  *description;
-    const char  *suggestion;
-    const char  *doc_anchor;
+	int code;
+	int phase;
+	const char *symbol;
+	const char *description;
+	const char *suggestion;
+	const char *doc_anchor;
 };
 
 /*
@@ -68,20 +68,20 @@ struct nfs_error_info {
  * n_phases    : length of phase_names[]; bounds-checks the lookup.
  */
 struct nfs_error_table {
-    const char                       *domain;
-    const struct nfs_error_info      *entries;
-    size_t                            n_entries;
-    const char *const                *phase_names;
-    size_t                            n_phases;
+	const char *domain;
+	const struct nfs_error_info *entries;
+	size_t n_entries;
+	const char *const *phase_names;
+	size_t n_phases;
 };
 
 /*
  * Cross-domain aggregate codes.  Reserved at the top of the numeric
  * range so they don't collide with any per-protocol code.
  */
-#define NFS_ERR_OK        0
-#define NFS_ERR_MIXED     250
-#define NFS_ERR_INTERNAL  255
+#define NFS_ERR_OK 0
+#define NFS_ERR_MIXED 250
+#define NFS_ERR_INTERNAL 255
 
 /*
  * nfs_error_register -- register a per-domain table.
@@ -113,7 +113,7 @@ nfs_error_lookup(int code, const struct nfs_error_table **table_out);
  * Returns "?" if the table is NULL or the phase index is out of range.
  */
 const char *nfs_error_phase_name(const struct nfs_error_table *table,
-                                 int phase);
+				 int phase);
 
 /*
  * nfs_error_emit_one -- pretty-print a single descriptor to f.

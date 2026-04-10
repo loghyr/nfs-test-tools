@@ -26,9 +26,9 @@
  * tc_ssl : per-connection SSL object (freed by tls_conn_close())
  */
 struct tls_conn {
-    int      tc_fd;
-    SSL_CTX *tc_ctx;
-    SSL     *tc_ssl;
+	int tc_fd;
+	SSL_CTX *tc_ctx;
+	SSL *tc_ssl;
 };
 
 /*
@@ -39,9 +39,9 @@ struct tls_conn {
  * pass NULL to skip recording.
  */
 struct tls_timing {
-    double tt_tcp_ms;       /* TCP connect() round-trip */
-    double tt_probe_ms;     /* AUTH_TLS probe send + reply receive */
-    double tt_handshake_ms; /* SSL_connect() */
+	double tt_tcp_ms; /* TCP connect() round-trip */
+	double tt_probe_ms; /* AUTH_TLS probe send + reply receive */
+	double tt_handshake_ms; /* SSL_connect() */
 };
 
 /*
@@ -59,8 +59,7 @@ struct tls_timing {
  *
  * Returns an SSL_CTX on success, NULL on error (errors logged to stderr).
  */
-SSL_CTX *tls_ctx_create(const char *ca_cert, const char *cert,
-                        const char *key);
+SSL_CTX *tls_ctx_create(const char *ca_cert, const char *cert, const char *key);
 
 /*
  * tls_ctx_enable_keylog -- enable SSLKEYLOGFILE-style key logging.
@@ -105,13 +104,10 @@ int tls_ctx_enable_keylog(SSL_CTX *ctx, const char *keylog_path);
  *
  * Returns 0 on success, -1 on error (errbuf filled).
  */
-int tls_connect_starttls(const char *host, const char *port,
-                         SSL_CTX *ctx,
-                         SSL_SESSION *session_in,
-                         struct tls_conn *conn,
-                         uint32_t xid,
-                         struct tls_timing *timing,
-                         char *errbuf, size_t errsz);
+int tls_connect_starttls(const char *host, const char *port, SSL_CTX *ctx,
+			 SSL_SESSION *session_in, struct tls_conn *conn,
+			 uint32_t xid, struct tls_timing *timing, char *errbuf,
+			 size_t errsz);
 
 /*
  * tls_send_nfs_null -- send a NULL RPC call over TLS and verify the reply.
@@ -120,8 +116,8 @@ int tls_connect_starttls(const char *host, const char *port,
  *
  * Returns 0 on success, -1 on error (errbuf filled).
  */
-int tls_send_nfs_null(struct tls_conn *conn, uint32_t xid,
-                      char *errbuf, size_t errsz);
+int tls_send_nfs_null(struct tls_conn *conn, uint32_t xid, char *errbuf,
+		      size_t errsz);
 
 /*
  * tls_conn_get_session -- retrieve the negotiated TLS session for reuse.
@@ -160,7 +156,7 @@ void tls_conn_print_info(const struct tls_conn *conn);
  * or the cert lacks a SAN extension entirely.
  */
 int tls_conn_check_san(const struct tls_conn *conn, const char *required,
-                       char *errbuf, size_t errsz);
+		       char *errbuf, size_t errsz);
 
 /*
  * tls_conn_get_alpn -- copy the negotiated ALPN protocol into buf.

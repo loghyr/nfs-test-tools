@@ -27,9 +27,9 @@
  *   V_WARN = 2   at least one check warned, none failed
  */
 enum diag_verdict {
-    DIAG_PASS = 0,
-    DIAG_FAIL = 1,
-    DIAG_WARN = 2,
+	DIAG_PASS = 0,
+	DIAG_FAIL = 1,
+	DIAG_WARN = 2,
 };
 
 /*
@@ -37,9 +37,9 @@ enum diag_verdict {
  * it belongs to; diag_run takes the same kind of mask and runs the
  * intersection.
  */
-#define DIAG_DOMAIN_TLS    (1u << 0)
-#define DIAG_DOMAIN_KRB5   (1u << 1)
-#define DIAG_DOMAIN_ALL    (DIAG_DOMAIN_TLS | DIAG_DOMAIN_KRB5)
+#define DIAG_DOMAIN_TLS (1u << 0)
+#define DIAG_DOMAIN_KRB5 (1u << 1)
+#define DIAG_DOMAIN_ALL (DIAG_DOMAIN_TLS | DIAG_DOMAIN_KRB5)
 
 /*
  * struct diag_check -- one entry in the registry.
@@ -53,9 +53,9 @@ enum diag_verdict {
  *             expected to call diag_emit() for its result line.
  */
 struct diag_check {
-    const char       *name;
-    unsigned          domains;
-    enum diag_verdict (*run)(void);
+	const char *name;
+	unsigned domains;
+	enum diag_verdict (*run)(void);
 };
 
 /*
@@ -128,6 +128,6 @@ int diagnose_run(void);
  * Returns 0 if all attempted checks pass, 1 on any failure.
  */
 int cert_info_run(const char *cert, const char *key, const char *ca,
-                  const char *required_san);
+		  const char *required_san);
 
 #endif /* DIAGNOSE_H */

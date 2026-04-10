@@ -28,23 +28,23 @@
  * all (non-Linux, kTLS not built, file missing).
  */
 struct tls_stat {
-    bool     present;
-    uint64_t curr_tx_sw;
-    uint64_t curr_rx_sw;
-    uint64_t curr_tx_device;
-    uint64_t curr_rx_device;
-    uint64_t tx_sw;
-    uint64_t rx_sw;
-    uint64_t tx_device;
-    uint64_t rx_device;
-    uint64_t decrypt_error;
-    uint64_t rx_no_pad_violation;
-    uint64_t decrypt_retry;
-    uint64_t tx_rekey_ok;
-    uint64_t rx_rekey_ok;
-    uint64_t tx_rekey_error;
-    uint64_t rx_rekey_error;
-    uint64_t rx_rekey_received;
+	bool present;
+	uint64_t curr_tx_sw;
+	uint64_t curr_rx_sw;
+	uint64_t curr_tx_device;
+	uint64_t curr_rx_device;
+	uint64_t tx_sw;
+	uint64_t rx_sw;
+	uint64_t tx_device;
+	uint64_t rx_device;
+	uint64_t decrypt_error;
+	uint64_t rx_no_pad_violation;
+	uint64_t decrypt_retry;
+	uint64_t tx_rekey_ok;
+	uint64_t rx_rekey_ok;
+	uint64_t tx_rekey_error;
+	uint64_t rx_rekey_error;
+	uint64_t rx_rekey_received;
 };
 
 /*
@@ -64,6 +64,6 @@ int tls_stat_snapshot(struct tls_stat *out);
  * incremented (callers can use this to upgrade verdicts to FAIL).
  */
 int tls_stat_diff_print(const struct tls_stat *before,
-                        const struct tls_stat *after);
+			const struct tls_stat *after);
 
 #endif /* TLS_STAT_H */

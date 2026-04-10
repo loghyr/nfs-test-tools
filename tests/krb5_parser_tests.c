@@ -41,16 +41,17 @@
 static int g_pass = 0;
 static int g_fail = 0;
 
-#define RUN_TEST(fn) do {                               \
-	int _rc = (fn)();                               \
-	if (_rc == 0) {                                 \
-		g_pass++;                               \
-		printf("PASS: %s\n", #fn);              \
-	} else {                                        \
-		g_fail++;                               \
-		printf("FAIL: %s\n", #fn);              \
-	}                                               \
-} while (0)
+#define RUN_TEST(fn)                               \
+	do {                                       \
+		int _rc = (fn)();                  \
+		if (_rc == 0) {                    \
+			g_pass++;                  \
+			printf("PASS: %s\n", #fn); \
+		} else {                           \
+			g_fail++;                  \
+			printf("FAIL: %s\n", #fn); \
+		}                                  \
+	} while (0)
 
 /* -----------------------------------------------------------------------
  * Wire-format builder helpers
@@ -63,13 +64,13 @@ static void put_u32(uint8_t *buf, size_t *pos, uint32_t v)
 {
 	buf[(*pos)++] = (uint8_t)((v >> 24) & 0xff);
 	buf[(*pos)++] = (uint8_t)((v >> 16) & 0xff);
-	buf[(*pos)++] = (uint8_t)((v >>  8) & 0xff);
-	buf[(*pos)++] = (uint8_t)( v        & 0xff);
+	buf[(*pos)++] = (uint8_t)((v >> 8) & 0xff);
+	buf[(*pos)++] = (uint8_t)(v & 0xff);
 }
 
 /* XDR opaque<>: 4-byte length + data + zero-padding to 4-byte boundary */
-static void put_opaque(uint8_t *buf, size_t *pos,
-		       const uint8_t *data, uint32_t len)
+static void put_opaque(uint8_t *buf, size_t *pos, const uint8_t *data,
+		       uint32_t len)
 {
 	put_u32(buf, pos, len);
 	memcpy(buf + *pos, data, len);
@@ -95,16 +96,16 @@ static size_t build_reply_header(uint8_t *buf,
 {
 	size_t pos = 0;
 	put_u32(buf, &pos, xid);
-	put_u32(buf, &pos, RPC_REPLY);          /* msg_type = 1 */
-	put_u32(buf, &pos, RPC_MSG_ACCEPTED);   /* reply_stat = 0 */
-	put_u32(buf, &pos, RPCSEC_GSS);         /* verf_flavor = 6 */
+	put_u32(buf, &pos, RPC_REPLY); /* msg_type = 1 */
+	put_u32(buf, &pos, RPC_MSG_ACCEPTED); /* reply_stat = 0 */
+	put_u32(buf, &pos, RPCSEC_GSS); /* verf_flavor = 6 */
 	put_u32(buf, &pos, verf_len);
 	if (verf_len > 0) {
 		uint32_t padded = (verf_len + 3u) & ~3u;
-		memset(buf + pos, 0xAA, padded);    /* dummy MIC bytes */
+		memset(buf + pos, 0xAA, padded); /* dummy MIC bytes */
 		pos += padded;
 	}
-	put_u32(buf, &pos, RPC_SUCCESS);        /* accept_stat = 0 */
+	put_u32(buf, &pos, RPC_SUCCESS); /* accept_stat = 0 */
 	return pos;
 }
 
@@ -143,8 +144,7 @@ static uint32_t g_mock_unwrap_seq = 0;
 static OM_uint32 mock_unwrap_ok(OM_uint32 *min_stat,
 				gss_ctx_id_t ctx __attribute__((unused)),
 				gss_buffer_t input __attribute__((unused)),
-				gss_buffer_t output,
-				int *conf_state,
+				gss_buffer_t output, int *conf_state,
 				gss_qop_t *qop)
 {
 	uint8_t *p = malloc(4);
@@ -154,11 +154,11 @@ static OM_uint32 mock_unwrap_ok(OM_uint32 *min_stat,
 	}
 	p[0] = (uint8_t)((g_mock_unwrap_seq >> 24) & 0xff);
 	p[1] = (uint8_t)((g_mock_unwrap_seq >> 16) & 0xff);
-	p[2] = (uint8_t)((g_mock_unwrap_seq >>  8) & 0xff);
-	p[3] = (uint8_t)( g_mock_unwrap_seq        & 0xff);
-	output->value  = p;
+	p[2] = (uint8_t)((g_mock_unwrap_seq >> 8) & 0xff);
+	p[3] = (uint8_t)(g_mock_unwrap_seq & 0xff);
+	output->value = p;
 	output->length = 4;
-	*conf_state    = 1;
+	*conf_state = 1;
 	if (qop)
 		*qop = 0;
 	*min_stat = 0;
@@ -169,8 +169,7 @@ static OM_uint32 mock_unwrap_ok(OM_uint32 *min_stat,
 static OM_uint32 mock_unwrap_noconf(OM_uint32 *min_stat,
 				    gss_ctx_id_t ctx __attribute__((unused)),
 				    gss_buffer_t input __attribute__((unused)),
-				    gss_buffer_t output,
-				    int *conf_state,
+				    gss_buffer_t output, int *conf_state,
 				    gss_qop_t *qop)
 {
 	uint8_t *p = malloc(4);
@@ -179,9 +178,9 @@ static OM_uint32 mock_unwrap_noconf(OM_uint32 *min_stat,
 		return GSS_S_FAILURE;
 	}
 	memset(p, 0, 4);
-	output->value  = p;
+	output->value = p;
 	output->length = 4;
-	*conf_state    = 0;   /* no confidentiality */
+	*conf_state = 0; /* no confidentiality */
 	if (qop)
 		*qop = 0;
 	*min_stat = 0;
@@ -194,7 +193,7 @@ static OM_uint32 mock_release_free(OM_uint32 *min_stat, gss_buffer_t buf)
 	*min_stat = 0;
 	if (buf && buf->value) {
 		free(buf->value);
-		buf->value  = NULL;
+		buf->value = NULL;
 		buf->length = 0;
 	}
 	return GSS_S_COMPLETE;
@@ -207,7 +206,7 @@ static OM_uint32 mock_release_free(OM_uint32 *min_stat, gss_buffer_t buf)
 static void test_gc_init(struct gss_ctx *gc, uint32_t seq_num)
 {
 	memset(gc, 0, sizeof(*gc));
-	gc->gc_ctx     = GSS_C_NO_CONTEXT;
+	gc->gc_ctx = GSS_C_NO_CONTEXT;
 	gc->gc_seq_num = seq_num;
 	/* gc_handle_len=0, gc_handle zeroed -- handle is empty */
 	/* mock pointers left NULL; tests set the ones they need */
@@ -223,15 +222,15 @@ static void test_gc_init(struct gss_ctx *gc, uint32_t seq_num)
 static int test_svc_none_valid(void)
 {
 	uint8_t buf[256];
-	size_t  body_len = build_reply_header(buf, sizeof(buf), 0x1234u, 0);
+	size_t body_len = build_reply_header(buf, sizeof(buf), 0x1234u, 0);
 
 	struct gss_ctx gc;
 	test_gc_init(&gc, 1u);
 
 	char errbuf[256] = { 0 };
 	int rc = parse_data_reply_verifier(buf, body_len, 0x1234u, &gc,
-					   RPCSEC_GSS_SVC_NONE,
-					   errbuf, sizeof(errbuf));
+					   RPCSEC_GSS_SVC_NONE, errbuf,
+					   sizeof(errbuf));
 	if (rc != 0)
 		printf("  error: %s\n", errbuf);
 	return rc;
@@ -245,19 +244,19 @@ static int test_svc_none_valid(void)
 
 static int test_svc_integ_valid(void)
 {
-	uint8_t  buf[256];
+	uint8_t buf[256];
 	uint32_t seq = 42u;
-	size_t   pos = build_reply_header(buf, sizeof(buf), 0xABCDu, 0);
+	size_t pos = build_reply_header(buf, sizeof(buf), 0xABCDu, 0);
 
 	uint8_t inner[4] = {
 		(uint8_t)((seq >> 24) & 0xff),
 		(uint8_t)((seq >> 16) & 0xff),
-		(uint8_t)((seq >>  8) & 0xff),
-		(uint8_t)( seq        & 0xff),
+		(uint8_t)((seq >> 8) & 0xff),
+		(uint8_t)(seq & 0xff),
 	};
-	uint8_t mic[4] = { 0x11, 0x22, 0x33, 0x44 };   /* ignored by mock */
-	put_opaque(buf, &pos, inner, 4);   /* opaque databody_integ<> */
-	put_opaque(buf, &pos, mic,   4);   /* opaque checksum<> */
+	uint8_t mic[4] = { 0x11, 0x22, 0x33, 0x44 }; /* ignored by mock */
+	put_opaque(buf, &pos, inner, 4); /* opaque databody_integ<> */
+	put_opaque(buf, &pos, mic, 4); /* opaque checksum<> */
 
 	struct gss_ctx gc;
 	test_gc_init(&gc, seq);
@@ -265,8 +264,8 @@ static int test_svc_integ_valid(void)
 
 	char errbuf[256] = { 0 };
 	int rc = parse_data_reply_verifier(buf, pos, 0xABCDu, &gc,
-					   RPCSEC_GSS_SVC_INTEG,
-					   errbuf, sizeof(errbuf));
+					   RPCSEC_GSS_SVC_INTEG, errbuf,
+					   sizeof(errbuf));
 	if (rc != 0)
 		printf("  error: %s\n", errbuf);
 	return rc;
@@ -281,25 +280,24 @@ static int test_svc_integ_valid(void)
 
 static int test_svc_priv_valid(void)
 {
-	uint8_t  buf[256];
+	uint8_t buf[256];
 	uint32_t seq = 42u;
-	size_t   pos = build_reply_header(buf, sizeof(buf), 0xDEADu, 0);
+	size_t pos = build_reply_header(buf, sizeof(buf), 0xDEADu, 0);
 
-	uint8_t wrapped[8] = { 0x55, 0x66, 0x77, 0x88,
-				0x99, 0xAA, 0xBB, 0xCC };
+	uint8_t wrapped[8] = { 0x55, 0x66, 0x77, 0x88, 0x99, 0xAA, 0xBB, 0xCC };
 	put_opaque(buf, &pos, wrapped, sizeof(wrapped));
 
 	g_mock_unwrap_seq = seq;
 
 	struct gss_ctx gc;
 	test_gc_init(&gc, seq);
-	gc.gc_unwrap         = mock_unwrap_ok;
+	gc.gc_unwrap = mock_unwrap_ok;
 	gc.gc_release_buffer = mock_release_free;
 
 	char errbuf[256] = { 0 };
 	int rc = parse_data_reply_verifier(buf, pos, 0xDEADu, &gc,
-					   RPCSEC_GSS_SVC_PRIV,
-					   errbuf, sizeof(errbuf));
+					   RPCSEC_GSS_SVC_PRIV, errbuf,
+					   sizeof(errbuf));
 	if (rc != 0)
 		printf("  error: %s\n", errbuf);
 	return rc;
@@ -314,9 +312,9 @@ static int test_svc_priv_valid(void)
 static int test_integ_truncated_inner_len(void)
 {
 	uint8_t buf[256];
-	size_t  pos = build_reply_header(buf, sizeof(buf), 0x0001u, 0);
+	size_t pos = build_reply_header(buf, sizeof(buf), 0x0001u, 0);
 	buf[pos++] = 0x00;
-	buf[pos++] = 0x00;   /* 2 bytes -- not a complete uint32 */
+	buf[pos++] = 0x00; /* 2 bytes -- not a complete uint32 */
 
 	struct gss_ctx gc;
 	test_gc_init(&gc, 1u);
@@ -324,8 +322,8 @@ static int test_integ_truncated_inner_len(void)
 
 	char errbuf[256] = { 0 };
 	int rc = parse_data_reply_verifier(buf, pos, 0x0001u, &gc,
-					   RPCSEC_GSS_SVC_INTEG,
-					   errbuf, sizeof(errbuf));
+					   RPCSEC_GSS_SVC_INTEG, errbuf,
+					   sizeof(errbuf));
 	if (rc == 0) {
 		printf("  expected failure but got success\n");
 		return -1;
@@ -342,13 +340,13 @@ static int test_integ_truncated_inner_len(void)
 
 static int test_integ_truncated_checksum(void)
 {
-	uint8_t  buf[256];
+	uint8_t buf[256];
 	uint32_t seq = 1u;
-	size_t   pos = build_reply_header(buf, sizeof(buf), 0x0002u, 0);
+	size_t pos = build_reply_header(buf, sizeof(buf), 0x0002u, 0);
 
 	uint8_t inner[4] = { 0, 0, 0, (uint8_t)seq };
 	put_opaque(buf, &pos, inner, 4);
-	put_u32(buf, &pos, 100u);   /* mic_len=100, but no mic bytes follow */
+	put_u32(buf, &pos, 100u); /* mic_len=100, but no mic bytes follow */
 
 	struct gss_ctx gc;
 	test_gc_init(&gc, seq);
@@ -356,8 +354,8 @@ static int test_integ_truncated_checksum(void)
 
 	char errbuf[256] = { 0 };
 	int rc = parse_data_reply_verifier(buf, pos, 0x0002u, &gc,
-					   RPCSEC_GSS_SVC_INTEG,
-					   errbuf, sizeof(errbuf));
+					   RPCSEC_GSS_SVC_INTEG, errbuf,
+					   sizeof(errbuf));
 	if (rc == 0) {
 		printf("  expected failure but got success\n");
 		return -1;
@@ -374,20 +372,20 @@ static int test_integ_truncated_checksum(void)
 
 static int test_integ_wrong_seq(void)
 {
-	uint8_t  buf[256];
-	uint32_t gc_seq    = 42u;
-	uint32_t inner_seq = 99u;   /* deliberate mismatch */
-	size_t   pos = build_reply_header(buf, sizeof(buf), 0x0003u, 0);
+	uint8_t buf[256];
+	uint32_t gc_seq = 42u;
+	uint32_t inner_seq = 99u; /* deliberate mismatch */
+	size_t pos = build_reply_header(buf, sizeof(buf), 0x0003u, 0);
 
 	uint8_t inner[4] = {
 		(uint8_t)((inner_seq >> 24) & 0xff),
 		(uint8_t)((inner_seq >> 16) & 0xff),
-		(uint8_t)((inner_seq >>  8) & 0xff),
-		(uint8_t)( inner_seq        & 0xff),
+		(uint8_t)((inner_seq >> 8) & 0xff),
+		(uint8_t)(inner_seq & 0xff),
 	};
 	uint8_t mic[4] = { 0x00, 0x00, 0x00, 0x00 };
 	put_opaque(buf, &pos, inner, 4);
-	put_opaque(buf, &pos, mic,   4);
+	put_opaque(buf, &pos, mic, 4);
 
 	struct gss_ctx gc;
 	test_gc_init(&gc, gc_seq);
@@ -395,8 +393,8 @@ static int test_integ_wrong_seq(void)
 
 	char errbuf[256] = { 0 };
 	int rc = parse_data_reply_verifier(buf, pos, 0x0003u, &gc,
-					   RPCSEC_GSS_SVC_INTEG,
-					   errbuf, sizeof(errbuf));
+					   RPCSEC_GSS_SVC_INTEG, errbuf,
+					   sizeof(errbuf));
 	if (rc == 0) {
 		printf("  expected failure but got success\n");
 		return -1;
@@ -416,19 +414,19 @@ static int test_integ_wrong_seq(void)
 
 static int test_integ_bad_mic(void)
 {
-	uint8_t  buf[256];
+	uint8_t buf[256];
 	uint32_t seq = 42u;
-	size_t   pos = build_reply_header(buf, sizeof(buf), 0x0004u, 0);
+	size_t pos = build_reply_header(buf, sizeof(buf), 0x0004u, 0);
 
 	uint8_t inner[4] = {
 		(uint8_t)((seq >> 24) & 0xff),
 		(uint8_t)((seq >> 16) & 0xff),
-		(uint8_t)((seq >>  8) & 0xff),
-		(uint8_t)( seq        & 0xff),
+		(uint8_t)((seq >> 8) & 0xff),
+		(uint8_t)(seq & 0xff),
 	};
 	uint8_t mic[4] = { 0xBA, 0xD0, 0xBA, 0xD0 };
 	put_opaque(buf, &pos, inner, 4);
-	put_opaque(buf, &pos, mic,   4);
+	put_opaque(buf, &pos, mic, 4);
 
 	struct gss_ctx gc;
 	test_gc_init(&gc, seq);
@@ -436,8 +434,8 @@ static int test_integ_bad_mic(void)
 
 	char errbuf[256] = { 0 };
 	int rc = parse_data_reply_verifier(buf, pos, 0x0004u, &gc,
-					   RPCSEC_GSS_SVC_INTEG,
-					   errbuf, sizeof(errbuf));
+					   RPCSEC_GSS_SVC_INTEG, errbuf,
+					   sizeof(errbuf));
 	if (rc == 0) {
 		printf("  expected failure but got success\n");
 		return -1;
@@ -459,20 +457,20 @@ static int test_integ_bad_mic(void)
 static int test_priv_no_conf(void)
 {
 	uint8_t buf[256];
-	size_t  pos = build_reply_header(buf, sizeof(buf), 0x0005u, 0);
+	size_t pos = build_reply_header(buf, sizeof(buf), 0x0005u, 0);
 
 	uint8_t wrapped[4] = { 0x01, 0x02, 0x03, 0x04 };
 	put_opaque(buf, &pos, wrapped, sizeof(wrapped));
 
 	struct gss_ctx gc;
 	test_gc_init(&gc, 1u);
-	gc.gc_unwrap         = mock_unwrap_noconf;
+	gc.gc_unwrap = mock_unwrap_noconf;
 	gc.gc_release_buffer = mock_release_free;
 
 	char errbuf[256] = { 0 };
 	int rc = parse_data_reply_verifier(buf, pos, 0x0005u, &gc,
-					   RPCSEC_GSS_SVC_PRIV,
-					   errbuf, sizeof(errbuf));
+					   RPCSEC_GSS_SVC_PRIV, errbuf,
+					   sizeof(errbuf));
 	if (rc == 0) {
 		printf("  expected failure but got success\n");
 		return -1;
@@ -494,14 +492,14 @@ static int test_priv_no_conf(void)
 
 static int test_integ_trailing_junk(void)
 {
-	uint8_t  buf[256];
+	uint8_t buf[256];
 	uint32_t seq = 7u;
-	size_t   pos = build_reply_header(buf, sizeof(buf), 0x0006u, 0);
+	size_t pos = build_reply_header(buf, sizeof(buf), 0x0006u, 0);
 
 	uint8_t inner[4] = { 0, 0, 0, (uint8_t)seq };
-	uint8_t mic[4]   = { 0xAA, 0xBB, 0xCC, 0xDD };
+	uint8_t mic[4] = { 0xAA, 0xBB, 0xCC, 0xDD };
 	put_opaque(buf, &pos, inner, 4);
-	put_opaque(buf, &pos, mic,   4);
+	put_opaque(buf, &pos, mic, 4);
 	/* append junk after the valid, correctly-padded checksum */
 	buf[pos++] = 0xFF;
 	buf[pos++] = 0xFF;
@@ -514,8 +512,8 @@ static int test_integ_trailing_junk(void)
 
 	char errbuf[256] = { 0 };
 	int rc = parse_data_reply_verifier(buf, pos, 0x0006u, &gc,
-					   RPCSEC_GSS_SVC_INTEG,
-					   errbuf, sizeof(errbuf));
+					   RPCSEC_GSS_SVC_INTEG, errbuf,
+					   sizeof(errbuf));
 	if (rc == 0) {
 		printf("  expected failure but got success\n");
 		return -1;
@@ -537,7 +535,7 @@ static int test_integ_trailing_junk(void)
 static int test_integ_empty_body(void)
 {
 	uint8_t buf[256];
-	size_t  body_len = build_reply_header(buf, sizeof(buf), 0x0007u, 0);
+	size_t body_len = build_reply_header(buf, sizeof(buf), 0x0007u, 0);
 	/* no body follows */
 
 	struct gss_ctx gc;
@@ -546,8 +544,8 @@ static int test_integ_empty_body(void)
 
 	char errbuf[256] = { 0 };
 	int rc = parse_data_reply_verifier(buf, body_len, 0x0007u, &gc,
-					   RPCSEC_GSS_SVC_INTEG,
-					   errbuf, sizeof(errbuf));
+					   RPCSEC_GSS_SVC_INTEG, errbuf,
+					   sizeof(errbuf));
 	if (rc == 0) {
 		printf("  expected failure but got success\n");
 		return -1;
@@ -569,15 +567,15 @@ static int test_integ_empty_body(void)
 static int test_wrong_xid(void)
 {
 	uint8_t buf[256];
-	size_t  body_len = build_reply_header(buf, sizeof(buf), 0x1111u, 0);
+	size_t body_len = build_reply_header(buf, sizeof(buf), 0x1111u, 0);
 
 	struct gss_ctx gc;
 	test_gc_init(&gc, 1u);
 
 	char errbuf[256] = { 0 };
 	int rc = parse_data_reply_verifier(buf, body_len, 0x2222u, &gc,
-					   RPCSEC_GSS_SVC_NONE,
-					   errbuf, sizeof(errbuf));
+					   RPCSEC_GSS_SVC_NONE, errbuf,
+					   sizeof(errbuf));
 	if (rc == 0) {
 		printf("  expected failure but got success\n");
 		return -1;
@@ -599,18 +597,18 @@ static int test_wrong_xid(void)
 static int test_denied_reply(void)
 {
 	uint8_t buf[256];
-	size_t  pos = 0;
-	put_u32(buf, &pos, 0x0042u);        /* xid */
-	put_u32(buf, &pos, RPC_REPLY);      /* msg_type = 1 */
-	put_u32(buf, &pos, 1u);             /* reply_stat = RPC_MSG_DENIED */
+	size_t pos = 0;
+	put_u32(buf, &pos, 0x0042u); /* xid */
+	put_u32(buf, &pos, RPC_REPLY); /* msg_type = 1 */
+	put_u32(buf, &pos, 1u); /* reply_stat = RPC_MSG_DENIED */
 
 	struct gss_ctx gc;
 	test_gc_init(&gc, 1u);
 
 	char errbuf[256] = { 0 };
 	int rc = parse_data_reply_verifier(buf, pos, 0x0042u, &gc,
-					   RPCSEC_GSS_SVC_NONE,
-					   errbuf, sizeof(errbuf));
+					   RPCSEC_GSS_SVC_NONE, errbuf,
+					   sizeof(errbuf));
 	if (rc == 0) {
 		printf("  expected failure but got success\n");
 		return -1;
@@ -633,12 +631,12 @@ static int test_denied_reply(void)
 static int test_priv_trailing_junk(void)
 {
 	uint8_t buf[512];
-	size_t  body_len = build_reply_header(buf, sizeof(buf), 0x000Bu, 0);
+	size_t body_len = build_reply_header(buf, sizeof(buf), 0x000Bu, 0);
 
 	/* databody_priv opaque: seq_num (4 bytes) wrapped as opaque */
 	uint8_t plain[4];
-	size_t  pp = 0;
-	put_u32(plain, &pp, 1u);            /* seq_num matches gc_seq_num */
+	size_t pp = 0;
+	put_u32(plain, &pp, 1u); /* seq_num matches gc_seq_num */
 
 	put_opaque(buf, &body_len, plain, (uint32_t)pp);
 
@@ -647,14 +645,14 @@ static int test_priv_trailing_junk(void)
 
 	struct gss_ctx gc;
 	test_gc_init(&gc, 1u);
-	gc.gc_unwrap     = mock_unwrap_ok;
-	gc.gc_release    = mock_release_free;
+	gc.gc_unwrap = mock_unwrap_ok;
+	gc.gc_release_buffer = mock_release_free;
 	g_mock_unwrap_seq = 1u;
 
 	char errbuf[256] = { 0 };
 	int rc = parse_data_reply_verifier(buf, body_len, 0x000Bu, &gc,
-					   RPCSEC_GSS_SVC_PRIV,
-					   errbuf, sizeof(errbuf));
+					   RPCSEC_GSS_SVC_PRIV, errbuf,
+					   sizeof(errbuf));
 	if (rc == 0) {
 		printf("  expected failure but got success\n");
 		return -1;

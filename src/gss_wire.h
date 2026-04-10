@@ -27,19 +27,19 @@
 #include <gssapi/gssapi.h>
 
 /* RPCSEC_GSS protocol version (RFC 2203 S5) */
-#define RPCSEC_GSS_VERSION	1u
+#define RPCSEC_GSS_VERSION 1u
 
 /* -----------------------------------------------------------------------
  * GSS context state (with mock injection for unit tests)
  * --------------------------------------------------------------------- */
 
 struct gss_ctx {
-	gss_ctx_id_t  gc_ctx;		/* GSS context handle */
-	gss_name_t    gc_svc_name;	/* target service name */
-	gss_OID       gc_mech;		/* negotiated mech (krb5) */
-	uint32_t      gc_handle_len;
-	uint8_t       gc_handle[256];	/* RPCSEC_GSS context handle from server */
-	uint32_t      gc_seq_num;	/* last sequence number used for DATA */
+	gss_ctx_id_t gc_ctx; /* GSS context handle */
+	gss_name_t gc_svc_name; /* target service name */
+	gss_OID gc_mech; /* negotiated mech (krb5) */
+	uint32_t gc_handle_len;
+	uint8_t gc_handle[256]; /* RPCSEC_GSS context handle from server */
+	uint32_t gc_seq_num; /* last sequence number used for DATA */
 
 	/*
 	 * Optional mock injection for unit tests.  When non-NULL,
@@ -47,12 +47,10 @@ struct gss_ctx {
 	 * GSSAPI functions.  Set by gss_ctx_defaults_init() to the real
 	 * functions in production.
 	 */
-	OM_uint32 (*gc_verify_mic)(OM_uint32 *, gss_ctx_id_t,
-				   gss_buffer_t, gss_buffer_t,
-				   gss_qop_t *);
-	OM_uint32 (*gc_unwrap)(OM_uint32 *, gss_ctx_id_t,
-			       gss_buffer_t, gss_buffer_t,
-			       int *, gss_qop_t *);
+	OM_uint32 (*gc_verify_mic)(OM_uint32 *, gss_ctx_id_t, gss_buffer_t,
+				   gss_buffer_t, gss_qop_t *);
+	OM_uint32 (*gc_unwrap)(OM_uint32 *, gss_ctx_id_t, gss_buffer_t,
+			       gss_buffer_t, int *, gss_qop_t *);
 	OM_uint32 (*gc_release_buffer)(OM_uint32 *, gss_buffer_t);
 };
 
@@ -71,8 +69,8 @@ void gss_ctx_defaults_init(struct gss_ctx *gc);
  * rpc_put_opaque -- append an XDR opaque<> (4-byte length + data + padding).
  * Returns 1 on success, 0 on overflow.
  */
-int rpc_put_opaque(uint8_t *buf, size_t bufsz, size_t *pos,
-		   const uint8_t *data, uint32_t len);
+int rpc_put_opaque(uint8_t *buf, size_t bufsz, size_t *pos, const uint8_t *data,
+		   uint32_t len);
 
 /*
  * build_gss_data_null -- build an RPCSEC_GSS DATA NULL call.
@@ -84,11 +82,9 @@ int rpc_put_opaque(uint8_t *buf, size_t bufsz, size_t *pos,
  *
  * Returns total byte count, or 0 on error (errbuf filled).
  */
-size_t build_gss_data_null(uint8_t *buf, size_t bufsz,
-			   uint32_t xid, uint32_t prog, uint32_t vers,
-			   struct gss_ctx *gc,
-			   uint32_t service,
-			   char *errbuf, size_t errsz);
+size_t build_gss_data_null(uint8_t *buf, size_t bufsz, uint32_t xid,
+			   uint32_t prog, uint32_t vers, struct gss_ctx *gc,
+			   uint32_t service, char *errbuf, size_t errsz);
 
 /*
  * parse_data_reply_verifier -- parse a DATA NULL reply and verify the
@@ -98,9 +94,7 @@ size_t build_gss_data_null(uint8_t *buf, size_t bufsz,
  * Returns 0 on success, -1 on error (errbuf filled).
  */
 int parse_data_reply_verifier(const uint8_t *body, size_t body_len,
-			      uint32_t expected_xid,
-			      struct gss_ctx *gc,
-			      uint32_t service,
-			      char *errbuf, size_t errsz);
+			      uint32_t expected_xid, struct gss_ctx *gc,
+			      uint32_t service, char *errbuf, size_t errsz);
 
 #endif /* GSS_WIRE_H */

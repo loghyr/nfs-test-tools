@@ -20,11 +20,10 @@
  * Production-default initialiser
  * --------------------------------------------------------------------- */
 
-void
-gss_ctx_defaults_init(struct gss_ctx *gc)
+void gss_ctx_defaults_init(struct gss_ctx *gc)
 {
-	gc->gc_verify_mic     = gss_verify_mic;
-	gc->gc_unwrap         = gss_unwrap;
+	gc->gc_verify_mic = gss_verify_mic;
+	gc->gc_unwrap = gss_unwrap;
 	gc->gc_release_buffer = gss_release_buffer;
 }
 
@@ -36,9 +35,8 @@ gss_ctx_defaults_init(struct gss_ctx *gc)
  * rpc_put_opaque -- write XDR opaque<>: 4-byte length + data + zero padding
  * to a 4-byte boundary.  Returns 1 on success, 0 on overflow.
  */
-int
-rpc_put_opaque(uint8_t *buf, size_t bufsz, size_t *pos,
-	       const uint8_t *data, uint32_t len)
+int rpc_put_opaque(uint8_t *buf, size_t bufsz, size_t *pos, const uint8_t *data,
+		   uint32_t len)
 {
 	if (!rpc_put_u32(buf, bufsz, pos, len))
 		return 0;
@@ -91,12 +89,9 @@ rpc_put_opaque(uint8_t *buf, size_t bufsz, size_t *pos,
  *
  * Returns total byte count, or 0 on error (errbuf filled).
  */
-size_t
-build_gss_data_null(uint8_t *buf, size_t bufsz,
-		    uint32_t xid, uint32_t prog, uint32_t vers,
-		    struct gss_ctx *gc,
-		    uint32_t service,
-		    char *errbuf, size_t errsz)
+size_t build_gss_data_null(uint8_t *buf, size_t bufsz, uint32_t xid,
+			   uint32_t prog, uint32_t vers, struct gss_ctx *gc,
+			   uint32_t service, char *errbuf, size_t errsz)
 {
 	gc->gc_seq_num++;
 
@@ -105,27 +100,40 @@ build_gss_data_null(uint8_t *buf, size_t bufsz,
 
 	size_t pos = 0;
 	size_t marker_pos = pos;
-	if (!rpc_put_u32(buf, bufsz, &pos, 0u)) goto overflow;
+	if (!rpc_put_u32(buf, bufsz, &pos, 0u))
+		goto overflow;
 
 	/* Record the start of the call header (xid offset = pos now = 4) */
 	size_t header_start = pos;
 
-	if (!rpc_put_u32(buf, bufsz, &pos, xid))               goto overflow;
-	if (!rpc_put_u32(buf, bufsz, &pos, RPC_CALL))          goto overflow;
-	if (!rpc_put_u32(buf, bufsz, &pos, 2u))                goto overflow;
-	if (!rpc_put_u32(buf, bufsz, &pos, prog))              goto overflow;
-	if (!rpc_put_u32(buf, bufsz, &pos, vers))              goto overflow;
-	if (!rpc_put_u32(buf, bufsz, &pos, NFS_PROC_NULL))     goto overflow;
+	if (!rpc_put_u32(buf, bufsz, &pos, xid))
+		goto overflow;
+	if (!rpc_put_u32(buf, bufsz, &pos, RPC_CALL))
+		goto overflow;
+	if (!rpc_put_u32(buf, bufsz, &pos, 2u))
+		goto overflow;
+	if (!rpc_put_u32(buf, bufsz, &pos, prog))
+		goto overflow;
+	if (!rpc_put_u32(buf, bufsz, &pos, vers))
+		goto overflow;
+	if (!rpc_put_u32(buf, bufsz, &pos, NFS_PROC_NULL))
+		goto overflow;
 
 	/* Credential */
-	if (!rpc_put_u32(buf, bufsz, &pos, RPCSEC_GSS))        goto overflow;
-	if (!rpc_put_u32(buf, bufsz, &pos, cred_body_len))     goto overflow;
-	if (!rpc_put_u32(buf, bufsz, &pos, RPCSEC_GSS_VERSION)) goto overflow;
-	if (!rpc_put_u32(buf, bufsz, &pos, RPCSEC_GSS_DATA))   goto overflow;
-	if (!rpc_put_u32(buf, bufsz, &pos, gc->gc_seq_num))    goto overflow;
-	if (!rpc_put_u32(buf, bufsz, &pos, service))           goto overflow;
-	if (!rpc_put_opaque(buf, bufsz, &pos,
-			    gc->gc_handle, gc->gc_handle_len)) goto overflow;
+	if (!rpc_put_u32(buf, bufsz, &pos, RPCSEC_GSS))
+		goto overflow;
+	if (!rpc_put_u32(buf, bufsz, &pos, cred_body_len))
+		goto overflow;
+	if (!rpc_put_u32(buf, bufsz, &pos, RPCSEC_GSS_VERSION))
+		goto overflow;
+	if (!rpc_put_u32(buf, bufsz, &pos, RPCSEC_GSS_DATA))
+		goto overflow;
+	if (!rpc_put_u32(buf, bufsz, &pos, gc->gc_seq_num))
+		goto overflow;
+	if (!rpc_put_u32(buf, bufsz, &pos, service))
+		goto overflow;
+	if (!rpc_put_opaque(buf, bufsz, &pos, gc->gc_handle, gc->gc_handle_len))
+		goto overflow;
 
 	/* Record end of header for MIC computation */
 	size_t header_end = pos;
@@ -133,14 +141,13 @@ build_gss_data_null(uint8_t *buf, size_t bufsz,
 	/* Verifier: gss_get_mic over [header_start, header_end).
 	 * Same for all three service flavors. */
 	gss_buffer_desc msg_buf;
-	msg_buf.value  = buf + header_start;
+	msg_buf.value = buf + header_start;
 	msg_buf.length = header_end - header_start;
 
 	gss_buffer_desc mic_buf = GSS_C_EMPTY_BUFFER;
 	OM_uint32 min_stat;
 	OM_uint32 maj_stat = gss_get_mic(&min_stat, gc->gc_ctx,
-					 GSS_C_QOP_DEFAULT,
-					 &msg_buf, &mic_buf);
+					 GSS_C_QOP_DEFAULT, &msg_buf, &mic_buf);
 	if (maj_stat != GSS_S_COMPLETE) {
 		snprintf(errbuf, errsz, "gss_get_mic on header: maj=%u min=%u",
 			 maj_stat, min_stat);
@@ -152,8 +159,7 @@ build_gss_data_null(uint8_t *buf, size_t bufsz,
 		gss_release_buffer(&min_stat, &mic_buf);
 		goto overflow;
 	}
-	if (!rpc_put_opaque(buf, bufsz, &pos,
-			    (const uint8_t *)mic_buf.value,
+	if (!rpc_put_opaque(buf, bufsz, &pos, (const uint8_t *)mic_buf.value,
 			    (uint32_t)mic_buf.length)) {
 		gss_release_buffer(&min_stat, &mic_buf);
 		goto overflow;
@@ -168,17 +174,18 @@ build_gss_data_null(uint8_t *buf, size_t bufsz,
 		/* No body */
 	} else if (service == RPCSEC_GSS_SVC_INTEG) {
 		uint8_t inner[4];
-		size_t  inner_pos = 0;
+		size_t inner_pos = 0;
 		/* sizeof(inner)==4; rpc_put_u32 cannot fail here, but check
 		 * for parity with every other call site in this function. */
-		if (!rpc_put_u32(inner, sizeof(inner), &inner_pos, gc->gc_seq_num))
+		if (!rpc_put_u32(inner, sizeof(inner), &inner_pos,
+				 gc->gc_seq_num))
 			goto overflow;
 
 		gss_buffer_desc inner_buf = { .length = inner_pos,
-					      .value  = inner };
-		gss_buffer_desc int_mic   = GSS_C_EMPTY_BUFFER;
-		maj_stat = gss_get_mic(&min_stat, gc->gc_ctx,
-				       GSS_C_QOP_DEFAULT, &inner_buf, &int_mic);
+					      .value = inner };
+		gss_buffer_desc int_mic = GSS_C_EMPTY_BUFFER;
+		maj_stat = gss_get_mic(&min_stat, gc->gc_ctx, GSS_C_QOP_DEFAULT,
+				       &inner_buf, &int_mic);
 		if (maj_stat != GSS_S_COMPLETE) {
 			snprintf(errbuf, errsz,
 				 "gss_get_mic on integ databody: maj=%u min=%u",
@@ -193,27 +200,28 @@ build_gss_data_null(uint8_t *buf, size_t bufsz,
 			goto overflow;
 		}
 		/* opaque checksum<> */
-		if (!rpc_put_opaque(buf, bufsz, &pos,
-				    int_mic.value, (uint32_t)int_mic.length)) {
+		if (!rpc_put_opaque(buf, bufsz, &pos, int_mic.value,
+				    (uint32_t)int_mic.length)) {
 			gss_release_buffer(&min_stat, &int_mic);
 			goto overflow;
 		}
 		gss_release_buffer(&min_stat, &int_mic);
 	} else if (service == RPCSEC_GSS_SVC_PRIV) {
 		uint8_t inner[4];
-		size_t  inner_pos = 0;
+		size_t inner_pos = 0;
 		/* sizeof(inner)==4; rpc_put_u32 cannot fail here, but check
 		 * for parity with every other call site in this function. */
-		if (!rpc_put_u32(inner, sizeof(inner), &inner_pos, gc->gc_seq_num))
+		if (!rpc_put_u32(inner, sizeof(inner), &inner_pos,
+				 gc->gc_seq_num))
 			goto overflow;
 
 		gss_buffer_desc inner_buf = { .length = inner_pos,
-					      .value  = inner };
-		gss_buffer_desc wrapped   = GSS_C_EMPTY_BUFFER;
+					      .value = inner };
+		gss_buffer_desc wrapped = GSS_C_EMPTY_BUFFER;
 		int conf_state = 0;
-		maj_stat = gss_wrap(&min_stat, gc->gc_ctx,
-				    1 /* conf_req */, GSS_C_QOP_DEFAULT,
-				    &inner_buf, &conf_state, &wrapped);
+		maj_stat = gss_wrap(&min_stat, gc->gc_ctx, 1 /* conf_req */,
+				    GSS_C_QOP_DEFAULT, &inner_buf, &conf_state,
+				    &wrapped);
 		if (maj_stat != GSS_S_COMPLETE) {
 			snprintf(errbuf, errsz,
 				 "gss_wrap on priv databody: maj=%u min=%u",
@@ -229,8 +237,8 @@ build_gss_data_null(uint8_t *buf, size_t bufsz,
 		}
 
 		/* opaque databody_priv<> */
-		if (!rpc_put_opaque(buf, bufsz, &pos,
-				    wrapped.value, (uint32_t)wrapped.length)) {
+		if (!rpc_put_opaque(buf, bufsz, &pos, wrapped.value,
+				    (uint32_t)wrapped.length)) {
 			gss_release_buffer(&min_stat, &wrapped);
 			goto overflow;
 		}
@@ -262,30 +270,27 @@ overflow:
  * Dispatch wrappers that call through mock pointers when set, or fall back
  * to the real GSSAPI functions.  These are internal to this file.
  */
-static OM_uint32
-do_verify_mic(struct gss_ctx *gc,
-	      OM_uint32 *min_stat, gss_buffer_t msg,
-	      gss_buffer_t mic, gss_qop_t *qop)
+static OM_uint32 do_verify_mic(struct gss_ctx *gc, OM_uint32 *min_stat,
+			       gss_buffer_t msg, gss_buffer_t mic,
+			       gss_qop_t *qop)
 {
 	if (gc->gc_verify_mic)
 		return gc->gc_verify_mic(min_stat, gc->gc_ctx, msg, mic, qop);
 	return gss_verify_mic(min_stat, gc->gc_ctx, msg, mic, qop);
 }
 
-static OM_uint32
-do_unwrap(struct gss_ctx *gc,
-	  OM_uint32 *min_stat, gss_buffer_t input,
-	  gss_buffer_t output, int *conf_state, gss_qop_t *qop)
+static OM_uint32 do_unwrap(struct gss_ctx *gc, OM_uint32 *min_stat,
+			   gss_buffer_t input, gss_buffer_t output,
+			   int *conf_state, gss_qop_t *qop)
 {
 	if (gc->gc_unwrap)
 		return gc->gc_unwrap(min_stat, gc->gc_ctx, input, output,
 				     conf_state, qop);
-	return gss_unwrap(min_stat, gc->gc_ctx, input, output,
-			  conf_state, qop);
+	return gss_unwrap(min_stat, gc->gc_ctx, input, output, conf_state, qop);
 }
 
-static OM_uint32
-do_release_buffer(struct gss_ctx *gc, OM_uint32 *min_stat, gss_buffer_t buf)
+static OM_uint32 do_release_buffer(struct gss_ctx *gc, OM_uint32 *min_stat,
+				   gss_buffer_t buf)
 {
 	if (gc->gc_release_buffer)
 		return gc->gc_release_buffer(min_stat, buf);
@@ -298,12 +303,9 @@ do_release_buffer(struct gss_ctx *gc, OM_uint32 *min_stat, gss_buffer_t buf)
  *
  * Returns 0 on success, -1 on error.
  */
-int
-parse_data_reply_verifier(const uint8_t *body, size_t body_len,
-			  uint32_t expected_xid,
-			  struct gss_ctx *gc,
-			  uint32_t service,
-			  char *errbuf, size_t errsz)
+int parse_data_reply_verifier(const uint8_t *body, size_t body_len,
+			      uint32_t expected_xid, struct gss_ctx *gc,
+			      uint32_t service, char *errbuf, size_t errsz)
 {
 	size_t pos = 0;
 	uint32_t xid, msg_type, reply_stat;
@@ -319,8 +321,8 @@ parse_data_reply_verifier(const uint8_t *body, size_t body_len,
 	if (xid != expected_xid || msg_type != RPC_REPLY ||
 	    reply_stat != RPC_MSG_ACCEPTED) {
 		snprintf(errbuf, errsz,
-			 "DATA reply: unexpected xid=%u msg=%u stat=%u",
-			 xid, msg_type, reply_stat);
+			 "DATA reply: unexpected xid=%u msg=%u stat=%u", xid,
+			 msg_type, reply_stat);
 		return -1;
 	}
 
@@ -343,7 +345,7 @@ parse_data_reply_verifier(const uint8_t *body, size_t body_len,
 			return -1;
 		}
 		gss_buffer_desc mic_buf;
-		mic_buf.value  = (void *)(body + pos);
+		mic_buf.value = (void *)(body + pos);
 		mic_buf.length = verf_len;
 
 		uint8_t seq_buf[4];
@@ -354,13 +356,12 @@ parse_data_reply_verifier(const uint8_t *body, size_t body_len,
 		}
 
 		gss_buffer_desc msg_buf;
-		msg_buf.value  = seq_buf;
+		msg_buf.value = seq_buf;
 		msg_buf.length = 4;
 
 		OM_uint32 min_stat, qop_state;
-		OM_uint32 maj_stat = do_verify_mic(gc, &min_stat,
-						   &msg_buf, &mic_buf,
-						   &qop_state);
+		OM_uint32 maj_stat = do_verify_mic(gc, &min_stat, &msg_buf,
+						   &mic_buf, &qop_state);
 		if (maj_stat != GSS_S_COMPLETE) {
 			snprintf(errbuf, errsz,
 				 "gss_verify_mic on reply verifier: "
@@ -409,7 +410,8 @@ parse_data_reply_verifier(const uint8_t *body, size_t body_len,
 		if (pos + inner_len > body_len) {
 			snprintf(errbuf, errsz,
 				 "krb5i reply: databody_integ truncated "
-				 "(len=%u)", inner_len);
+				 "(len=%u)",
+				 inner_len);
 			return -1;
 		}
 		const uint8_t *inner_p = body + pos;
@@ -433,13 +435,12 @@ parse_data_reply_verifier(const uint8_t *body, size_t body_len,
 			return -1;
 		}
 		gss_buffer_desc inner_buf = { .length = inner_len,
-					      .value  = (void *)inner_p };
-		gss_buffer_desc chk_buf   = { .length = mic_len,
-					      .value  = (void *)(body + pos) };
+					      .value = (void *)inner_p };
+		gss_buffer_desc chk_buf = { .length = mic_len,
+					    .value = (void *)(body + pos) };
 		OM_uint32 min_stat, qop_state;
-		OM_uint32 maj_stat = do_verify_mic(gc, &min_stat,
-						   &inner_buf, &chk_buf,
-						   &qop_state);
+		OM_uint32 maj_stat = do_verify_mic(gc, &min_stat, &inner_buf,
+						   &chk_buf, &qop_state);
 		if (maj_stat != GSS_S_COMPLETE) {
 			snprintf(errbuf, errsz,
 				 "krb5i reply: gss_verify_mic on databody "
@@ -500,7 +501,8 @@ parse_data_reply_verifier(const uint8_t *body, size_t body_len,
 		if (pos + wrapped_len > body_len) {
 			snprintf(errbuf, errsz,
 				 "krb5p reply: databody_priv truncated "
-				 "(len=%u)", wrapped_len);
+				 "(len=%u)",
+				 wrapped_len);
 			return -1;
 		}
 		/* RFC 2203 S5.3.3: after the wrapped token there must be no
@@ -516,13 +518,13 @@ parse_data_reply_verifier(const uint8_t *body, size_t body_len,
 			return -1;
 		}
 		gss_buffer_desc wrapped = { .length = wrapped_len,
-					    .value  = (void *)(body + pos) };
-		gss_buffer_desc plain   = GSS_C_EMPTY_BUFFER;
+					    .value = (void *)(body + pos) };
+		gss_buffer_desc plain = GSS_C_EMPTY_BUFFER;
 		OM_uint32 min_stat;
 		int conf_state = 0;
 		gss_qop_t qop_state = 0;
-		OM_uint32 maj_stat = do_unwrap(gc, &min_stat, &wrapped,
-					       &plain, &conf_state, &qop_state);
+		OM_uint32 maj_stat = do_unwrap(gc, &min_stat, &wrapped, &plain,
+					       &conf_state, &qop_state);
 		if (maj_stat != GSS_S_COMPLETE) {
 			snprintf(errbuf, errsz,
 				 "krb5p reply: gss_unwrap failed "
@@ -564,7 +566,7 @@ parse_data_reply_verifier(const uint8_t *body, size_t body_len,
 		return 0;
 	}
 
-	snprintf(errbuf, errsz,
-		 "DATA reply: unknown service flavor %u", service);
+	snprintf(errbuf, errsz, "DATA reply: unknown service flavor %u",
+		 service);
 	return -1;
 }
