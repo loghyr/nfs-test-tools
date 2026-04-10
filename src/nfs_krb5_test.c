@@ -806,9 +806,11 @@ static int parse_data_reply_verifier(const uint8_t *body, size_t body_len,
  * Rather than #ifdef on the krb5 implementation, we ask GSS for the
  * mech-specific display string via gss_display_status() and pattern
  * match on substrings.  The downside is locale fragility; the upside
- * is that it works on any conformant GSS implementation that uses
- * the standard libkrb5 error messages (MIT does; recent Heimdal
- * mostly does too).
+ * is that it works on any conformant GSS implementation.
+ *
+ * Patterns include both MIT and Heimdal phrasings where they differ.
+ * MIT phrasing is listed first; Heimdal alternative follows.  Neither
+ * list is exhaustive -- if a new phrasing is needed, add it here.
  *
  * Returns the most specific krb5_error_code we can identify, falling
  * back to KRB5_ERR_GSS_INIT_FAILED if nothing matches.
@@ -857,23 +859,36 @@ krb5_classify_gss(OM_uint32 maj, OM_uint32 min, gss_OID mech)
              * Order matters: more specific patterns first so the
              * generic INTEGRITY catch doesn't shadow KVNO.
              */
-            if (strstr(s, "lock skew")) {
+            if (strstr(s, "lock skew") ||
+                /* Heimdal: "time skew too great" */
+                strstr(s, "time skew")) {
                 matched = KRB5_ERR_CLOCK_SKEW;
             } else if (strstr(s, "Cannot find KDC") ||
                        strstr(s, "Cannot contact any KDC") ||
-                       strstr(s, "Connection refused")) {
+                       strstr(s, "Connection refused") ||
+                       /* Heimdal: "unable to reach any KDC" */
+                       strstr(s, "unable to reach any KDC")) {
                 matched = KRB5_ERR_KDC_UNREACHABLE;
             } else if (strstr(s, "No credentials cache") ||
                        strstr(s, "credentials cache file") ||
-                       strstr(s, "No such file or directory")) {
+                       strstr(s, "No such file or directory") ||
+                       /* Heimdal: "no ticket file" / "no credentials" */
+                       strstr(s, "no ticket file") ||
+                       strstr(s, "no credentials")) {
                 matched = KRB5_ERR_NO_TGT;
-            } else if (strstr(s, "icket expired")) {
+            } else if (strstr(s, "icket expired") ||
+                       /* Heimdal: "ticket is expired" */
+                       strstr(s, "ticket is expired")) {
                 matched = KRB5_ERR_TGT_EXPIRED;
-            } else if (strstr(s, "ot yet valid")) {
+            } else if (strstr(s, "ot yet valid") ||
+                       /* Heimdal: "ticket not yet valid" */
+                       strstr(s, "ticket not yet valid")) {
                 matched = KRB5_ERR_TGT_NOT_YET_VALID;
             } else if (strstr(s, "key table entry not found") ||
                        strstr(s, "Key table entry not found") ||
-                       strstr(s, "no suitable keys")) {
+                       strstr(s, "no suitable keys") ||
+                       /* Heimdal: "no entry for" (keytab) */
+                       strstr(s, "no entry for")) {
                 matched = KRB5_ERR_KEYTAB_NO_PRINCIPAL;
             } else if (strstr(s, "ey version") &&
                        (strstr(s, "not available") ||
@@ -881,21 +896,31 @@ krb5_classify_gss(OM_uint32 maj, OM_uint32 min, gss_OID mech)
                 matched = KRB5_ERR_BAD_KVNO;
             } else if (strstr(s, "Decrypt integrity check") ||
                        strstr(s, "decrypt integrity") ||
-                       strstr(s, "BAD_INTEGRITY")) {
+                       strstr(s, "BAD_INTEGRITY") ||
+                       /* Heimdal: "failed to decrypt" */
+                       strstr(s, "failed to decrypt")) {
                 matched = KRB5_ERR_BAD_INTEGRITY;
-            } else if (strstr(s, "Server") && strstr(s, "not found in")) {
+            } else if ((strstr(s, "Server") && strstr(s, "not found in")) ||
+                       /* Heimdal: "Server not found in Kerberos database" */
+                       (strstr(s, "not found in Kerberos"))) {
                 matched = KRB5_ERR_PRINCIPAL_UNKNOWN;
             } else if (strstr(s, "ncryption type") &&
                        strstr(s, "supported")) {
                 matched = KRB5_ERR_BAD_ENCTYPE;
-            } else if (strstr(s, "Permission denied") &&
-                       strstr(s, "keytab")) {
+            } else if ((strstr(s, "Permission denied") &&
+                        strstr(s, "keytab")) ||
+                       /* Heimdal: "error opening keytab" */
+                       strstr(s, "error opening keytab")) {
                 matched = KRB5_ERR_KEYTAB_NOT_READABLE;
             } else if (strstr(s, "Pre-authentication failed") ||
-                       strstr(s, "PREAUTH_FAILED")) {
+                       strstr(s, "PREAUTH_FAILED") ||
+                       /* Heimdal: "preauthentication failed" */
+                       strstr(s, "preauthentication failed")) {
                 matched = KRB5_ERR_PREAUTH_FAILED;
             } else if (strstr(s, "not in the same realm") ||
-                       strstr(s, "BAD_REALM")) {
+                       strstr(s, "BAD_REALM") ||
+                       /* Heimdal: "wrong realm" */
+                       strstr(s, "wrong realm")) {
                 matched = KRB5_ERR_BAD_REALM;
             }
         }
