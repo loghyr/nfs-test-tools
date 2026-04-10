@@ -518,9 +518,11 @@ def analyze_krb5(r: Krb5Result, blocks=None) -> list:
         return findings
 
     # FAIL path: prefer the symbolic blocks if the tool emitted any.
-    # They carry the precise failure class plus a doc anchor and
-    # superseed the older step_causes heuristic, which existed only
-    # because nfs_krb5_test used to print free-form fprintf lines.
+    # They supersede the older step_causes heuristic: symbolic blocks
+    # carry the precise failure class plus a doc anchor, whereas the
+    # step heuristic only maps the step name to a broad explanation.
+    # The heuristic is kept as a fallback for output from pre-taxonomy
+    # nfs_krb5_test builds (before the [ERROR SYMBOL] commit).
     if blocks:
         add_symbol_findings(findings, blocks, "krb5")
         if not r.context_established:
@@ -530,8 +532,8 @@ def analyze_krb5(r: Krb5Result, blocks=None) -> list:
 
     # No symbolic blocks: fall back to the historical step heuristic.
     # This branch only runs against output from older nfs_krb5_test
-    # builds (pre-taxonomy commit) and can be removed once nothing
-    # in CI runs the legacy binary.
+    # builds (pre-taxonomy commit).  Remove once nothing in CI runs
+    # the legacy binary.
     step_causes = {
         'tcp_connect':         'Server not reachable: wrong host/port, firewall, or server down',
         'gss_import_name':     'Invalid --principal syntax; use "nfs/hostname@REALM" or "nfs@hostname"',
