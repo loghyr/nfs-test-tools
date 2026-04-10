@@ -787,24 +787,31 @@ When everything is broken and you don't know where to start:
 
 1. **Pre-flight:** kernel ≥ 6.12, `tlshd` running on both ends, mount
    command actually contains `xprtsec=tls` or `xprtsec=mtls`.
+   Run `nfs_tls_test --diagnose` to check most of this in one shot.
 2. **Reachability:** `nc -vz server 2049` succeeds.
-3. **Standalone TLS:** `socat` smoke test using the same cert files.
+3. **Cert sanity:** `nfs_cert_info --cert ... --key ... --ca ...` to
+   validate the cert files locally without involving NFS at all.
+4. **Standalone TLS:** `socat` smoke test using the same cert files.
    If this fails, NFS is irrelevant -- fix the certs.
-4. **Active probe:** `nfs_tls_test --host server --tls-info`.  Read
-   the `Error breakdown` and `tls-info` output.
-5. **tlshd journal:** `journalctl -u tlshd -f` on both ends with
+5. **Active probe:** `nfs_tls_test --host server --tls-info
+   --check-san "IP:...,DNS:..." --snapshot-stats`.  Read the
+   `Error breakdown`, `tls-info`, and kTLS counter delta output.
+6. **tlshd journal:** `journalctl -u tlshd -f` on both ends with
    `loglevel=7`, `tls=7` in `/etc/tlshd.conf`.  Trigger the failing
    mount.  Read the GnuTLS error chain.
-6. **Kernel tracepoints:** enable
+7. **Kernel tracepoints:** enable
    `/sys/kernel/tracing/events/sunrpc/*tls*/enable` and watch
    `trace_pipe` to confirm the kernel is even attempting the
    handshake.
-7. **Decrypt the wire:** `SSLKEYLOGFILE` + `tshark` + Wireshark to
-   see the actual protocol exchange post-handshake.
-8. **kTLS counters:** `cat /proc/net/tls_stat` before and after.
-   Look for `TlsDecryptError` and rekey errors.
+8. **Decrypt the wire:** `nfs_tls_test --host server
+   --keylog /tmp/keylog.txt` (or `SSLKEYLOGFILE` for `tlshd`) +
+   `tshark` + Wireshark to see the actual protocol exchange
+   post-handshake.
+9. **kTLS counters:** `cat /proc/net/tls_stat` before and after, or
+   let `nfs_tls_test --snapshot-stats` do it for you.  Look for
+   `TlsDecryptError` and rekey errors.
 
-If you get to step 8 and still don't know what's wrong, the failure
+If you get to step 9 and still don't know what's wrong, the failure
 is probably in the NFS server's TLS integration (server-side bug)
 or in a kernel TLS edge case.  Capture everything and file an
 upstream bug.

@@ -188,6 +188,120 @@ as the CA cert.
   --tls-info
 ```
 
+### Diagnostic and debugging options
+
+For when something is broken and you need more than latencies:
+
+#### Local pre-flight checks
+
+Before debugging a connection, check the local system:
+
+```bash
+./nfs_tls_test --diagnose
+```
+
+Verifies kernel version, `CONFIG_SUNRPC_TLS`, the `tls` module,
+`tlshd` presence and runtime state, and OpenSSL version.  Emits a
+structured PASS/FAIL/WARN report.  No network IO; no `--host`
+required.
+
+#### Decrypt the wire with Wireshark
+
+```bash
+./nfs_tls_test --host SERVER --keylog /tmp/keylog.txt
+```
+
+Writes NSS-format TLS session keys to `/tmp/keylog.txt`.  Capture
+traffic with `tcpdump`/`tshark` separately, then point Wireshark at
+the keylog file (`Edit -> Preferences -> Protocols -> TLS ->
+(Pre)-Master-Secret log filename`) to see decrypted RPC and NFS
+content.
+
+#### Verify server certificate SAN
+
+```bash
+./nfs_tls_test --host SERVER \
+  --check-san "IP:10.0.0.1,DNS:nfs.example.com"
+```
+
+After the handshake, verifies that the server's leaf certificate
+SAN includes every required entry.  A missing entry counts as a
+handshake-phase failure.
+
+#### Watch kernel TLS counters
+
+```bash
+./nfs_tls_test --host SERVER --threads 4 --duration 60 \
+  --snapshot-stats
+```
+
+Reads `/proc/net/tls_stat` before and after the run and prints
+deltas.  Any non-zero `TlsDecryptError`, rekey errors, or
+no-pad violations are flagged and folded into the exit status --
+a passing functional test that increments these counters is a real
+failure that latency-only monitoring would miss.
+
+#### Strict-mode enforcement
+
+```bash
+./nfs_tls_test --host SERVER --require-tls13 --require-alpn sunrpc
+```
+
+Promotes any TLS version below 1.3 from a WARN to a hard FAIL, and
+requires a specific ALPN protocol (default check is already
+`sunrpc` per RFC 9289; this lets you enforce arbitrary protocols
+for non-NFS testing).
+
+#### JSON output for CI integration
+
+```bash
+./nfs_tls_test --host SERVER --output json
+```
+
+Emits a single JSON object instead of the human-readable report.
+The shape is documented in `--help` and is intended to be parsed
+by downstream CI tooling without scraping the ASCII format.
+
+---
+
+## nfs_cert_info
+
+A standalone certificate validation tool: load a PEM cert (and
+optionally a key, CA bundle, and required SAN entries) and emit a
+structured report without performing any network IO.  This is the
+openssl-equivalent of the certificate troubleshooting commands in
+`TROUBLESHOOTING.md`, packaged as one tool invocation.
+
+```bash
+# Basic inspection
+./nfs_cert_info --cert /etc/nfs/server.pem
+
+# Verify cert/key pair match
+./nfs_cert_info --cert /etc/nfs/server.pem --key /etc/nfs/server.key
+
+# Verify against a CA bundle
+./nfs_cert_info --cert /etc/nfs/server.pem --ca /etc/nfs/ca.pem
+
+# Require specific SAN entries
+./nfs_cert_info --cert /etc/nfs/server.pem \
+  --require-san "IP:10.0.0.1,DNS:nfs.example.com"
+
+# Everything together
+./nfs_cert_info \
+  --cert /etc/nfs/server.pem \
+  --key  /etc/nfs/server.key \
+  --ca   /etc/nfs/ca.pem \
+  --require-san "IP:10.0.0.1,DNS:nfs.example.com"
+```
+
+Exit codes: 0 = PASS, 1 = FAIL, 2 = WARN.
+
+Useful for cron-driven cert expiration monitoring and pre-deployment
+validation -- catches expired certs, missing SAN entries, broken cert
+chains, and key/cert mismatches without ever opening a socket.
+
+---
+
 ### Analyzing results
 
 Pipe output through `scripts/analyze_nfs_results.py` for a
