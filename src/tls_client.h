@@ -68,7 +68,13 @@ SSL_CTX *tls_ctx_create(const char *ca_cert, const char *cert,
  * Sets a keylog callback on the SSL_CTX that appends NSS key-log lines
  * (CLIENT_HANDSHAKE_TRAFFIC_SECRET, etc.) to the file at keylog_path.
  * The file is opened in append mode and remains open for the lifetime
- * of the context; callers should not delete the file mid-run.
+ * of the process; callers should not delete the file mid-run.
+ *
+ * IMPORTANT: this is a process-wide singleton.  Only the FIRST call's
+ * keylog_path is honoured; subsequent calls install the callback on
+ * additional SSL_CTX objects but do not redirect to a different file.
+ * The file descriptor is intentionally never closed; the OS reclaims
+ * it on process exit.
  *
  * Wireshark / tshark can import this file via
  *   Edit -> Preferences -> Protocols -> TLS -> (Pre)-Master-Secret log

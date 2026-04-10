@@ -101,11 +101,14 @@ static size_t build_null_reply(uint8_t *buf, size_t bufsz, uint32_t xid)
 
 /*
  * Read one RPC record from a plain fd.  Returns body length and fills
- * out body[].  Returns 0 on EOF, -1 on error.
+ * out body[].  Returns 0 on EOF, -1 on error.  *body_len_out is
+ * initialised to 0 so callers don't read uninitialised storage on EOF.
  */
 static int read_rpc_record_fd(int fd, uint8_t *body, size_t bodysz,
                               uint32_t *body_len_out)
 {
+    *body_len_out = 0;
+
     uint8_t marker_buf[4];
     ssize_t r = rpc_readn(fd, marker_buf, 4);
     if (r == 0) return 0;
@@ -124,15 +127,31 @@ static int read_rpc_record_fd(int fd, uint8_t *body, size_t bodysz,
 }
 
 /*
- * Read one RPC record from an SSL connection.  Same return contract.
+ * Read one RPC record from an SSL connection.
+ *
+ * Returns 1 on success, 0 on clean EOF (peer closed gracefully), -1 on
+ * any other error.  *body_len_out is initialised to 0 so callers don't
+ * read uninitialised storage on EOF.
  */
 static int read_rpc_record_ssl(SSL *ssl, uint8_t *body, size_t bodysz,
                                uint32_t *body_len_out)
 {
+    *body_len_out = 0;
+
     uint8_t marker_buf[4];
-    int n = SSL_read(ssl, marker_buf, 4);
-    if (n == 0) return 0;
-    if (n != 4) return -1;
+    size_t got = 0;
+    while (got < 4) {
+        int r = SSL_read(ssl, marker_buf + got, (int)(4 - got));
+        if (r == 0) {
+            /* Clean EOF.  If we got nothing, this is a graceful
+             * close between records and the caller should stop
+             * silently.  If we got a partial marker, the peer
+             * truncated mid-record -- treat as error. */
+            return (got == 0) ? 0 : -1;
+        }
+        if (r < 0) return -1;
+        got += (size_t)r;
+    }
 
     size_t mpos = 0;
     uint32_t marker;
@@ -141,11 +160,12 @@ static int read_rpc_record_ssl(SSL *ssl, uint8_t *body, size_t bodysz,
     uint32_t body_len = marker & ~RPC_LAST_FRAG;
     if (body_len == 0 || body_len > bodysz) return -1;
 
-    int got = 0;
-    while (got < (int)body_len) {
-        int r = SSL_read(ssl, body + got, (int)body_len - got);
-        if (r <= 0) return -1;
-        got += r;
+    got = 0;
+    while (got < body_len) {
+        int r = SSL_read(ssl, body + got, (int)(body_len - got));
+        if (r == 0) return -1;   /* EOF mid-record is an error */
+        if (r <  0) return -1;
+        got += (size_t)r;
     }
     *body_len_out = body_len;
     return 1;
@@ -190,6 +210,11 @@ static int parse_rpc_call(const uint8_t *body, size_t body_len,
 
 /* --- TLS server context --- */
 
+static int alpn_select_cb(SSL *ssl, const unsigned char **out,
+                          unsigned char *outlen,
+                          const unsigned char *in, unsigned int inlen,
+                          void *arg);
+
 static SSL_CTX *create_server_ctx(const char *cert, const char *key,
                                   const char *ca_cert, int require_mtls)
 {
@@ -199,6 +224,13 @@ static SSL_CTX *create_server_ctx(const char *cert, const char *key,
         return NULL;
     }
     SSL_CTX_set_min_proto_version(ctx, TLS1_3_VERSION);
+
+    /*
+     * Install ALPN selection once on the SSL_CTX.  Each SSL inherits
+     * the callback at SSL_new() time, so this must be set before any
+     * connection is accepted.
+     */
+    SSL_CTX_set_alpn_select_cb(ctx, alpn_select_cb, NULL);
 
     if (!SSL_CTX_use_certificate_file(ctx, cert, SSL_FILETYPE_PEM) ||
         !SSL_CTX_use_PrivateKey_file(ctx, key, SSL_FILETYPE_PEM)) {
@@ -309,6 +341,12 @@ static void handle_one(int cfd, SSL_CTX *ctx, struct conn_stats *stats,
     /* Send the STARTTLS reply (NULL_RESPONSE with AUTH_NONE verifier) */
     uint8_t reply[NULL_REPLY_MAX];
     size_t reply_len = build_null_reply(reply, sizeof(reply), xid);
+    if (reply_len == 0) {
+        if (stats->verbose)
+            printf("  STARTTLS: build_null_reply overflow\n");
+        stats->fail_starttls++;
+        return;
+    }
     if (rpc_writen(cfd, reply, reply_len) != (ssize_t)reply_len) {
         if (stats->verbose)
             printf("  STARTTLS reply write failed: %s\n", strerror(errno));
@@ -321,11 +359,16 @@ static void handle_one(int cfd, SSL_CTX *ctx, struct conn_stats *stats,
     /* TLS handshake */
     SSL *ssl = SSL_new(ctx);
     if (!ssl) {
+        if (stats->verbose) {
+            unsigned long e = ERR_get_error();
+            char buf[256];
+            ERR_error_string_n(e, buf, sizeof(buf));
+            printf("  SSL_new failed: %s\n", buf);
+        }
         stats->fail_handshake++;
         return;
     }
     SSL_set_fd(ssl, cfd);
-    SSL_CTX_set_alpn_select_cb(ctx, alpn_select_cb, NULL);
 
     if (SSL_accept(ssl) != 1) {
         if (stats->verbose) {
@@ -375,6 +418,11 @@ static void handle_one(int cfd, SSL_CTX *ctx, struct conn_stats *stats,
         }
 
         size_t rl = build_null_reply(reply, sizeof(reply), rxid);
+        if (rl == 0) {
+            if (stats->verbose)
+                printf("  build_null_reply overflow\n");
+            break;
+        }
         if (SSL_write(ssl, reply, (int)rl) != (int)rl)
             break;
 

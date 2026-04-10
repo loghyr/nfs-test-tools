@@ -612,7 +612,8 @@ static int san_check_one(STACK_OF(GENERAL_NAME) *sans, int type_hint,
             const char *dns = (const char *)
                 ASN1_STRING_get0_data(gn->d.dNSName);
             int dns_len = ASN1_STRING_length(gn->d.dNSName);
-            if (dns_len > 0 && (size_t)dns_len == strlen(value) &&
+            if (dns && dns_len > 0 &&
+                (size_t)dns_len == strlen(value) &&
                 strncasecmp(dns, value, (size_t)dns_len) == 0)
                 return 1;
         }

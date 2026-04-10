@@ -18,6 +18,8 @@
 #include <errno.h>
 #include <sys/utsname.h>
 #include <sys/stat.h>
+#include <sys/wait.h>
+#include <arpa/inet.h>
 #include <openssl/ssl.h>
 #include <openssl/x509.h>
 #include <openssl/x509v3.h>
@@ -218,12 +220,35 @@ static enum verdict check_tlshd(void)
     }
     emit("tlshd-installed", V_PASS, found_path);
 
-    /* Check whether tlshd is running.  We shell out to pgrep rather
-     * than scanning /proc ourselves to keep this file header-light. */
+    /*
+     * Check whether tlshd is running.  We shell out to pgrep rather
+     * than scanning /proc ourselves to keep this file header-light.
+     *
+     * Distinguish three cases:
+     *   - exit 0      : tlshd is running
+     *   - exit 1      : tlshd is not running
+     *   - exit 127    : pgrep is not installed (cannot check)
+     *   - rc == -1    : system() itself failed
+     *
+     * Without this distinction, a missing pgrep would be silently
+     * misreported as "tlshd not running".
+     */
     int rc = system("pgrep -x tlshd >/dev/null 2>&1");
-    if (rc == 0) {
-        emit("tlshd-running", V_PASS, "tlshd process found");
-        return V_PASS;
+    if (rc == -1) {
+        emit("tlshd-running", V_WARN, "system() failed");
+        return V_WARN;
+    }
+    if (WIFEXITED(rc)) {
+        int code = WEXITSTATUS(rc);
+        if (code == 0) {
+            emit("tlshd-running", V_PASS, "tlshd process found");
+            return V_PASS;
+        }
+        if (code == 127) {
+            emit("tlshd-running", V_WARN,
+                 "cannot check (pgrep not installed)");
+            return V_WARN;
+        }
     }
     emit("tlshd-running", V_WARN,
          "tlshd not running (systemctl start tlshd)");
@@ -367,31 +392,60 @@ static enum verdict report_cert_basics(X509 *cert)
         emit("cert-san", V_WARN, "no subjectAltName extension");
         v = combine(v, V_WARN);
     } else {
+        /*
+         * Build a comma-separated SAN summary into buf.  Each snprintf
+         * call must check both error (n < 0) and truncation (n >= avail)
+         * before advancing pos -- otherwise pos can overshoot sizeof(buf)
+         * and the next iteration writes past the end.
+         */
         char buf[1024];
         size_t pos = 0;
+        bool truncated = false;
         int n = sk_GENERAL_NAME_num(sans);
-        for (int i = 0; i < n && pos < sizeof(buf) - 32; i++) {
+        for (int i = 0; i < n && !truncated; i++) {
             GENERAL_NAME *gn = sk_GENERAL_NAME_value(sans, i);
             if (!gn) continue;
+
+            size_t avail = sizeof(buf) - pos;
+            int written = -1;
             if (gn->type == GEN_DNS) {
-                pos += (size_t)snprintf(buf + pos, sizeof(buf) - pos,
-                    "%sDNS:%.*s",
-                    pos ? ", " : "",
-                    ASN1_STRING_length(gn->d.dNSName),
-                    (const char *)ASN1_STRING_get0_data(gn->d.dNSName));
+                const char *d = (const char *)
+                    ASN1_STRING_get0_data(gn->d.dNSName);
+                int dl = ASN1_STRING_length(gn->d.dNSName);
+                if (d && dl >= 0)
+                    written = snprintf(buf + pos, avail, "%sDNS:%.*s",
+                                       pos ? ", " : "", dl, d);
             } else if (gn->type == GEN_IPADD) {
-                const unsigned char *ip = ASN1_STRING_get0_data(gn->d.iPAddress);
+                const unsigned char *ip =
+                    ASN1_STRING_get0_data(gn->d.iPAddress);
                 int iplen = ASN1_STRING_length(gn->d.iPAddress);
-                if (iplen == 4) {
-                    pos += (size_t)snprintf(buf + pos, sizeof(buf) - pos,
-                        "%sIP:%u.%u.%u.%u",
-                        pos ? ", " : "",
-                        ip[0], ip[1], ip[2], ip[3]);
-                } else if (iplen == 16) {
-                    pos += (size_t)snprintf(buf + pos, sizeof(buf) - pos,
-                        "%sIP:(IPv6)", pos ? ", " : "");
+                if (ip && iplen == 4) {
+                    written = snprintf(buf + pos, avail,
+                                       "%sIP:%u.%u.%u.%u",
+                                       pos ? ", " : "",
+                                       ip[0], ip[1], ip[2], ip[3]);
+                } else if (ip && iplen == 16) {
+                    char ip6[INET6_ADDRSTRLEN];
+                    if (inet_ntop(AF_INET6, ip, ip6, sizeof(ip6)))
+                        written = snprintf(buf + pos, avail,
+                                           "%sIP:%s",
+                                           pos ? ", " : "", ip6);
                 }
             }
+
+            if (written < 0)
+                continue;
+            if ((size_t)written >= avail) {
+                /* Truncated -- mark it and stop */
+                if (avail > 0)
+                    buf[sizeof(buf) - 1] = '\0';
+                /* Best-effort marker if there is room */
+                if (pos + 5 < sizeof(buf))
+                    memcpy(buf + sizeof(buf) - 5, "...", 4);
+                truncated = true;
+                break;
+            }
+            pos += (size_t)written;
         }
         emit("cert-san", V_PASS, buf);
         sk_GENERAL_NAME_pop_free(sans, GENERAL_NAME_free);
@@ -577,11 +631,11 @@ int cert_info_run(const char *cert_path, const char *key_path,
             char buf[300];
             snprintf(buf, sizeof(buf), "%s: not a regular file", key_path);
             emit("key-load", V_FAIL, buf);
-            total = V_FAIL;
+            total = combine(total, V_FAIL);
         } else {
             EVP_PKEY *key = load_pkey(key_path);
             if (!key) {
-                total = V_FAIL;
+                total = combine(total, V_FAIL);
             } else {
                 total = combine(total, report_cert_key_match(cert, key));
                 EVP_PKEY_free(key);
@@ -594,7 +648,7 @@ int cert_info_run(const char *cert_path, const char *key_path,
             char buf[300];
             snprintf(buf, sizeof(buf), "%s: not a regular file", ca_path);
             emit("ca-load", V_FAIL, buf);
-            total = V_FAIL;
+            total = combine(total, V_FAIL);
         } else {
             total = combine(total, report_chain(cert, ca_path));
         }
