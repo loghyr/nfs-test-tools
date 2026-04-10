@@ -311,7 +311,10 @@ static size_t build_gss_data_null(uint8_t *buf, size_t bufsz,
     } else if (service == RPCSEC_GSS_SVC_INTEG) {
         uint8_t inner[4];
         size_t  inner_pos = 0;
-        rpc_put_u32(inner, sizeof(inner), &inner_pos, gc->gc_seq_num);
+        /* sizeof(inner)==4; rpc_put_u32 cannot fail here, but check for
+         * parity with every other call site in this function. */
+        if (!rpc_put_u32(inner, sizeof(inner), &inner_pos, gc->gc_seq_num))
+            goto overflow;
 
         gss_buffer_desc inner_buf = { .length = inner_pos, .value = inner };
         gss_buffer_desc int_mic   = GSS_C_EMPTY_BUFFER;
@@ -339,7 +342,10 @@ static size_t build_gss_data_null(uint8_t *buf, size_t bufsz,
     } else if (service == RPCSEC_GSS_SVC_PRIV) {
         uint8_t inner[4];
         size_t  inner_pos = 0;
-        rpc_put_u32(inner, sizeof(inner), &inner_pos, gc->gc_seq_num);
+        /* sizeof(inner)==4; rpc_put_u32 cannot fail here, but check for
+         * parity with every other call site in this function. */
+        if (!rpc_put_u32(inner, sizeof(inner), &inner_pos, gc->gc_seq_num))
+            goto overflow;
 
         gss_buffer_desc inner_buf = { .length = inner_pos, .value = inner };
         gss_buffer_desc wrapped   = GSS_C_EMPTY_BUFFER;
