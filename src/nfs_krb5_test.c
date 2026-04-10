@@ -36,6 +36,7 @@
 #include <unistd.h>
 #include <errno.h>
 #include <getopt.h>
+#include <pthread.h>
 #include <arpa/inet.h>
 #include <sys/types.h>
 #include <sys/socket.h>
@@ -499,6 +500,7 @@ struct options {
     int         o_print_error_table; /* dump krb5 error taxonomy and exit */
     int         o_stress;            /* run all iterations, count per code */
     int         o_probe_secinfo;     /* run SECINFO probe and exit */
+    int         o_threads;           /* >1 = multi-thread mode */
     const char *o_krb5_trace;        /* path for KRB5_TRACE; NULL = off */
     uint32_t    o_sec;               /* RPCSEC_GSS_SVC_NONE/INTEG/PRIV */
 };
@@ -985,6 +987,371 @@ static int probe_secinfo(const struct options *opts)
 }
 
 /* -----------------------------------------------------------------------
+ * GSS context establishment -- shared by single-thread main() and workers
+ *
+ * Connects to opts->o_host:o_port, imports the service principal, and
+ * runs the RPCSEC_GSS INIT / CONTINUE_INIT exchange.
+ *
+ * On success: *fd_out is the live TCP socket, *gc is fully initialised.
+ *   Caller owns both; must call gss_delete_sec_context() + close().
+ * On failure: *fd_out is -1, gc is zeroed; returns a krb5 error code.
+ *
+ * verbose != 0 enables per-step progress output (single-thread only;
+ *   workers always pass 0 to avoid interleaved output).
+ * --------------------------------------------------------------------- */
+static int krb5_establish_context(const struct options *opts,
+                                   struct gss_ctx *gc, int *fd_out,
+                                   int verbose,
+                                   char *errbuf, size_t errsz)
+{
+	memset(gc, 0, sizeof(*gc));
+	gss_ctx_defaults_init(gc);
+	gc->gc_ctx = GSS_C_NO_CONTEXT;
+	*fd_out = -1;
+
+	int fd = tcp_connect_host(opts->o_host, opts->o_port, errbuf, errsz);
+	if (fd < 0)
+		return NFS_ERR_INTERNAL;
+
+	gss_buffer_desc name_buf;
+	name_buf.value  = (void *)opts->o_principal;
+	name_buf.length = strlen(opts->o_principal);
+
+	OM_uint32 min_stat, maj_stat;
+	maj_stat = gss_import_name(&min_stat, &name_buf,
+	                           GSS_C_NT_HOSTBASED_SERVICE,
+	                           &gc->gc_svc_name);
+	if (maj_stat != GSS_S_COMPLETE) {
+		int code = krb5_emit_gss_failure("gss_import_name",
+		                                 maj_stat, min_stat,
+		                                 GSS_C_NO_OID);
+		close(fd);
+		return code;
+	}
+	if (verbose)
+		printf("  gss_import_name OK\n");
+
+	gss_buffer_desc in_token  = GSS_C_EMPTY_BUFFER;
+	gss_buffer_desc out_token = GSS_C_EMPTY_BUFFER;
+	int complete = 0;
+	uint32_t xid = (uint32_t)getpid();
+	uint32_t gss_proc = RPCSEC_GSS_INIT;
+	uint8_t call_buf[RPC_MSG_MAX];
+	uint8_t reply_buf[RPC_MSG_MAX];
+
+	while (!complete) {
+		maj_stat = gss_init_sec_context(
+		    &min_stat,
+		    GSS_C_NO_CREDENTIAL,
+		    &gc->gc_ctx,
+		    gc->gc_svc_name,
+		    GSS_C_NO_OID,
+		    GSS_C_MUTUAL_FLAG | GSS_C_SEQUENCE_FLAG,
+		    0,
+		    GSS_C_NO_CHANNEL_BINDINGS,
+		    &in_token,
+		    &gc->gc_mech,
+		    &out_token,
+		    NULL,
+		    NULL);
+
+		if (in_token.value) {
+			free(in_token.value);
+			in_token.value  = NULL;
+			in_token.length = 0;
+		}
+
+		if (maj_stat != GSS_S_COMPLETE &&
+		    maj_stat != GSS_S_CONTINUE_NEEDED) {
+			int code = krb5_emit_gss_failure("gss_init_sec_context",
+			                                 maj_stat, min_stat,
+			                                 gc->gc_mech);
+			gss_release_buffer(&min_stat, &out_token);
+			gss_release_name(&min_stat, &gc->gc_svc_name);
+			close(fd);
+			return code;
+		}
+
+		if (verbose)
+			printf("  gss_init_sec_context: out_token=%zu bytes"
+			       " gss_proc=%u\n",
+			       out_token.length, gss_proc);
+
+		if (out_token.length > 0) {
+			xid++;
+			size_t call_len = build_gss_init_call(
+			    call_buf, sizeof(call_buf), xid,
+			    NFS_PROGRAM, NFS_VERSION_4, gss_proc,
+			    gc->gc_handle, gc->gc_handle_len, &out_token);
+			gss_release_buffer(&min_stat, &out_token);
+
+			if (call_len == 0) {
+				nfs_error_emit_one(stderr, NFS_ERR_INTERNAL,
+				                   "build_gss_init_call: "
+				                   "buffer overflow");
+				gss_release_name(&min_stat, &gc->gc_svc_name);
+				close(fd);
+				return NFS_ERR_INTERNAL;
+			}
+			if (rpc_writen(fd, call_buf, call_len) !=
+			    (ssize_t)call_len) {
+				snprintf(errbuf, errsz,
+				         "write INIT call: %s", strerror(errno));
+				gss_release_name(&min_stat, &gc->gc_svc_name);
+				close(fd);
+				return NFS_ERR_INTERNAL;
+			}
+
+			ssize_t rlen = read_rpc_reply(fd, reply_buf,
+			                               sizeof(reply_buf),
+			                               errbuf, errsz);
+			if (rlen < 0) {
+				nfs_error_emit_one(stderr,
+				                   KRB5_ERR_RPCSEC_GSS_FAILED,
+				                   errbuf);
+				gss_release_name(&min_stat, &gc->gc_svc_name);
+				close(fd);
+				return KRB5_ERR_RPCSEC_GSS_FAILED;
+			}
+
+			int done = parse_gss_init_reply(reply_buf,
+			                                 (size_t)rlen, xid,
+			                                 gc, &in_token,
+			                                 errbuf, errsz);
+			if (done < 0) {
+				nfs_error_emit_one(stderr,
+				                   KRB5_ERR_RPCSEC_BAD_CRED,
+				                   errbuf);
+				gss_release_name(&min_stat, &gc->gc_svc_name);
+				close(fd);
+				return KRB5_ERR_RPCSEC_BAD_CRED;
+			}
+			if (verbose)
+				printf("  INIT reply: handle_len=%u done=%d\n",
+				       gc->gc_handle_len, done);
+		} else {
+			gss_release_buffer(&min_stat, &out_token);
+		}
+
+		if (maj_stat == GSS_S_COMPLETE)
+			complete = 1;
+		else
+			gss_proc = RPCSEC_GSS_CONTINUE;
+	}
+
+	*fd_out = fd;
+	return NFS_ERR_OK;
+}
+
+/* -----------------------------------------------------------------------
+ * Multi-threaded stress (--threads N)
+ *
+ * Each worker thread establishes its own RPCSEC_GSS context and runs
+ * opts->o_iterations DATA NULL calls on that single context.  All workers
+ * run concurrently, stressing the server's per-context replay cache and
+ * the RPCSEC_GSS seq_num sequencer.
+ *
+ * Per-worker failure counts are stored in w_fail_by_code[] (indexed at
+ * code - 100 for krb5 codes 100..199).  Main thread aggregates after
+ * pthread_join, so no atomics are needed on these counters.
+ * --------------------------------------------------------------------- */
+
+struct krb5_worker {
+	pthread_t       w_thread;
+	struct options *w_opts;
+	int             w_id;
+
+	long   w_ok;
+	long   w_fail_by_code[100];    /* index = code - 100 */
+	long   w_fail_internal;
+	long   w_fail_unclassified;
+	int    w_result;               /* first non-OK code seen, or NFS_ERR_OK */
+};
+
+static void *krb5_worker_thread(void *arg)
+{
+	struct krb5_worker *w = (struct krb5_worker *)arg;
+	struct options     *o = w->w_opts;
+	char errbuf[512];
+	uint8_t call_buf[RPC_MSG_MAX];
+	uint8_t reply_buf[RPC_MSG_MAX];
+
+	struct gss_ctx gc;
+	int fd = -1;
+	int rc = krb5_establish_context(o, &gc, &fd,
+	                                 0 /* no verbose output from workers */,
+	                                 errbuf, sizeof(errbuf));
+	if (rc != NFS_ERR_OK) {
+		if (rc >= 100 && rc < 200)
+			w->w_fail_by_code[rc - 100]++;
+		else
+			w->w_fail_internal++;
+		w->w_result = rc;
+		return NULL;
+	}
+
+	uint32_t xid = (uint32_t)getpid() + (uint32_t)w->w_id * 0x10000u;
+	OM_uint32 min_stat;
+
+	for (long i = 0; i < o->o_iterations; i++) {
+		xid++;
+		int iter_code = NFS_ERR_OK;
+
+		size_t call_len = build_gss_data_null(
+		    call_buf, sizeof(call_buf), xid,
+		    NFS_PROGRAM, NFS_VERSION_4,
+		    &gc, o->o_sec, errbuf, sizeof(errbuf));
+		if (call_len == 0) {
+			iter_code = KRB5_ERR_GSS_CONTEXT_EXPIRED;
+			goto record;
+		}
+		if (rpc_writen(fd, call_buf, call_len) != (ssize_t)call_len) {
+			snprintf(errbuf, sizeof(errbuf),
+			         "write DATA NULL: %s", strerror(errno));
+			iter_code = NFS_ERR_INTERNAL;
+			goto record;
+		}
+		{
+			ssize_t rlen = read_rpc_reply(fd, reply_buf,
+			                               sizeof(reply_buf),
+			                               errbuf, sizeof(errbuf));
+			if (rlen < 0) {
+				iter_code = KRB5_ERR_RPCSEC_CTXPROBLEM;
+				goto record;
+			}
+			if (parse_data_reply_verifier(reply_buf, (size_t)rlen,
+			                               xid, &gc, o->o_sec,
+			                               errbuf, sizeof(errbuf))
+			    < 0) {
+				iter_code = KRB5_ERR_GSS_BAD_MIC;
+				goto record;
+			}
+		}
+		w->w_ok++;
+		continue;
+
+record:
+		if (iter_code >= 100 && iter_code < 200)
+			w->w_fail_by_code[iter_code - 100]++;
+		else if (iter_code == NFS_ERR_INTERNAL)
+			w->w_fail_internal++;
+		else
+			w->w_fail_unclassified++;
+		if (w->w_result == NFS_ERR_OK)
+			w->w_result = iter_code;
+	}
+
+	gss_buffer_desc out_tok = GSS_C_EMPTY_BUFFER;
+	gss_delete_sec_context(&min_stat, &gc.gc_ctx, &out_tok);
+	gss_release_buffer(&min_stat, &out_tok);
+	gss_release_name(&min_stat, &gc.gc_svc_name);
+	close(fd);
+	return NULL;
+}
+
+/*
+ * krb5_run_threads -- spawn opts->o_threads workers, join them, and
+ * print an aggregate summary.  Returns NFS_ERR_OK / a krb5 code /
+ * NFS_ERR_MIXED.
+ */
+static int krb5_run_threads(const struct options *opts)
+{
+	int n = opts->o_threads;
+	struct krb5_worker *workers = calloc((size_t)n, sizeof(*workers));
+	if (!workers) {
+		fprintf(stderr, "threads: calloc: %s\n", strerror(errno));
+		return NFS_ERR_INTERNAL;
+	}
+
+	const char *sec_label =
+	    (opts->o_sec == RPCSEC_GSS_SVC_NONE)  ? "krb5"
+	  : (opts->o_sec == RPCSEC_GSS_SVC_INTEG) ? "krb5i"
+	                                           : "krb5p";
+
+	printf("threads: %d worker%s, %ld iteration%s each, --sec %s\n",
+	       n, n == 1 ? "" : "s",
+	       opts->o_iterations, opts->o_iterations == 1 ? "" : "s",
+	       sec_label);
+
+	for (int i = 0; i < n; i++) {
+		workers[i].w_opts   = (struct options *)opts;
+		workers[i].w_id     = i;
+		workers[i].w_result = NFS_ERR_OK;
+		pthread_create(&workers[i].w_thread, NULL,
+		               krb5_worker_thread, &workers[i]);
+	}
+	for (int i = 0; i < n; i++)
+		pthread_join(workers[i].w_thread, NULL);
+
+	/* Aggregate per-worker counts */
+	long total_ok              = 0;
+	long total_fail_by_code[100] = { 0 };
+	long total_fail_internal   = 0;
+	long total_fail_unclassified = 0;
+
+	for (int i = 0; i < n; i++) {
+		total_ok               += workers[i].w_ok;
+		total_fail_internal    += workers[i].w_fail_internal;
+		total_fail_unclassified += workers[i].w_fail_unclassified;
+		for (int j = 0; j < 100; j++)
+			total_fail_by_code[j] += workers[i].w_fail_by_code[j];
+	}
+	free(workers);
+
+	long total_attempts = (long)n * opts->o_iterations;
+	printf("threads: %d worker%s, %ld attempt%s, %ld ok\n",
+	       n, n == 1 ? "" : "s",
+	       total_attempts, total_attempts == 1 ? "" : "s",
+	       total_ok);
+
+	int distinct    = 0;
+	int single_code = NFS_ERR_OK;
+
+	for (int idx = 0; idx < 100; idx++) {
+		if (total_fail_by_code[idx] == 0)
+			continue;
+		int code = 100 + idx;
+		char ctx[96];
+		snprintf(ctx, sizeof(ctx), "%ld failure%s across %d worker%s",
+		         total_fail_by_code[idx],
+		         total_fail_by_code[idx] == 1 ? "" : "s",
+		         n, n == 1 ? "" : "s");
+		nfs_error_emit_one(stderr, code, ctx);
+		distinct++;
+		single_code = code;
+	}
+	if (total_fail_internal > 0) {
+		char ctx[64];
+		snprintf(ctx, sizeof(ctx),
+		         "%ld transport/internal failure%s",
+		         total_fail_internal,
+		         total_fail_internal == 1 ? "" : "s");
+		nfs_error_emit_one(stderr, NFS_ERR_INTERNAL, ctx);
+		distinct++;
+		single_code = NFS_ERR_INTERNAL;
+	}
+	if (total_fail_unclassified > 0) {
+		fprintf(stderr,
+		        "[ERROR ?]  (%ld unclassified failure%s -- "
+		        "please file a bug)\n",
+		        total_fail_unclassified,
+		        total_fail_unclassified == 1 ? "" : "s");
+		distinct++;
+		single_code = NFS_ERR_INTERNAL;
+	}
+
+	if (distinct == 0) {
+		printf("PASS\n");
+		return NFS_ERR_OK;
+	} else if (distinct == 1) {
+		printf("FAIL\n");
+		return single_code;
+	}
+	printf("FAIL (mixed)\n");
+	return NFS_ERR_MIXED;
+}
+
+/* -----------------------------------------------------------------------
  * Option parsing
  * --------------------------------------------------------------------- */
 
@@ -1011,6 +1378,12 @@ static void usage(const char *prog)
             "                        and reports what flavors the server\n"
             "                        advertises and whether --sec is present.\n"
             "                        Exits without attempting Kerberos setup.\n"
+            "  --threads N           Spawn N worker threads (1..256); each\n"
+            "                        establishes its own RPCSEC_GSS context and\n"
+            "                        runs --iterations NULL calls.  Hammers the\n"
+            "                        server's per-context replay cache with\n"
+            "                        concurrent independent contexts.  Aggregate\n"
+            "                        results are reported after all workers join.\n"
             "  --stress              Run all iterations even after failures,\n"
             "                        count by symbolic error code, and report\n"
             "                        per-code totals at the end.  Useful for\n"
@@ -1069,6 +1442,7 @@ static void parse_options(int argc, char **argv, struct options *o)
         { "print-error-table",no_argument,       NULL, 'E' },
         { "krb5-trace",       required_argument, NULL, 'T' },
         { "probe-secinfo",    no_argument,       NULL, 'Q' },
+        { "threads",          required_argument, NULL, 't' },
         { NULL, 0, NULL, 0 }
     };
 
@@ -1091,6 +1465,13 @@ static void parse_options(int argc, char **argv, struct options *o)
         case 'E': o->o_print_error_table = 1;           break;
         case 'T': o->o_krb5_trace       = optarg;       break;
         case 'Q': o->o_probe_secinfo    = 1;            break;
+        case 't':
+            o->o_threads = atoi(optarg);
+            if (o->o_threads < 1 || o->o_threads > 256) {
+                fprintf(stderr, "Error: --threads must be 1..256\n\n");
+                usage(argv[0]);
+            }
+            break;
         default:  usage(argv[0]);
         }
     }
@@ -1171,6 +1552,10 @@ int main(int argc, char **argv)
      * NFS4ERR_WRONGSEC failures before committing a Kerberos ticket. */
     if (opts.o_probe_secinfo)
         return probe_secinfo(&opts);
+
+    /* --threads N: each worker establishes its own GSS context concurrently. */
+    if (opts.o_threads >= 1)
+        return krb5_run_threads(&opts);
 
     /* Build default principal "nfs@HOST" if not specified */
     char default_principal[512];
