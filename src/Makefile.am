@@ -28,7 +28,10 @@ nfs_tls_server_LDADD   = $(OPENSSL_LIBS)
 if HAVE_GSSAPI
 bin_PROGRAMS += nfs_krb5_test
 
-nfs_krb5_test_SOURCES = nfs_krb5_test.c
+nfs_krb5_test_SOURCES = \
+	nfs_krb5_test.c \
+	nfs_error.c \
+	krb5_error.c
 nfs_krb5_test_CFLAGS  = $(GSSAPI_CFLAGS)
 nfs_krb5_test_LDADD   = $(GSSAPI_LIBS)
 endif
