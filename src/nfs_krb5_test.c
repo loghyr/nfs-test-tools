@@ -25,6 +25,9 @@
  */
 
 #include "rpc_wire.h"
+#include "nfs_error.h"
+#include "krb5_error.h"
+#include "diagnose.h"
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -520,6 +523,145 @@ static int parse_data_reply_verifier(const uint8_t *body, size_t body_len,
 }
 
 /* -----------------------------------------------------------------------
+ * GSS status classification
+ * --------------------------------------------------------------------- */
+
+/*
+ * krb5_classify_gss -- map a GSS-API (major, minor) status pair into a
+ * canonical krb5_error_code from the taxonomy in krb5_error.h.
+ *
+ * The major status carries a routine error from the GSS-API spec; we
+ * switch on it first because those values are vendor-portable.
+ *
+ * For the krb5 mech-specific minor status (which is what carries
+ * "Clock skew", "Ticket expired", "Server not in database", etc.) the
+ * raw integer values are MIT-internal and not portable to Heimdal.
+ * Rather than #ifdef on the krb5 implementation, we ask GSS for the
+ * mech-specific display string via gss_display_status() and pattern
+ * match on substrings.  The downside is locale fragility; the upside
+ * is that it works on any conformant GSS implementation that uses
+ * the standard libkrb5 error messages (MIT does; recent Heimdal
+ * mostly does too).
+ *
+ * Returns the most specific krb5_error_code we can identify, falling
+ * back to KRB5_ERR_GSS_INIT_FAILED if nothing matches.
+ */
+static enum krb5_error_code
+krb5_classify_gss(OM_uint32 maj, OM_uint32 min, gss_OID mech)
+{
+    /* GSS major routine errors -- vendor portable */
+    OM_uint32 routine = GSS_ROUTINE_ERROR(maj);
+    if (routine == GSS_S_BAD_NAME)             return KRB5_ERR_GSS_BAD_NAME;
+    if (routine == GSS_S_BAD_NAMETYPE)         return KRB5_ERR_GSS_BAD_NAME;
+    if (routine == GSS_S_BAD_MECH)             return KRB5_ERR_GSS_BAD_MECH;
+    if (routine == GSS_S_NO_CRED)              return KRB5_ERR_GSS_NO_CRED;
+    if (routine == GSS_S_DEFECTIVE_TOKEN)      return KRB5_ERR_GSS_DEFECTIVE_TOKEN;
+    if (routine == GSS_S_DEFECTIVE_CREDENTIAL) return KRB5_ERR_GSS_DEFECTIVE_CRED;
+    if (routine == GSS_S_CREDENTIALS_EXPIRED)  return KRB5_ERR_GSS_CRED_EXPIRED;
+    if (routine == GSS_S_CONTEXT_EXPIRED)      return KRB5_ERR_GSS_CONTEXT_EXPIRED;
+    /* GSS_S_BAD_MIC and GSS_S_BAD_SIG are the same value per RFC 2744
+     * errata; some headers only define BAD_SIG.  Map both to the
+     * MIC-flavor symbol since that's the more commonly recognised
+     * spelling in modern docs. */
+#ifdef GSS_S_BAD_MIC
+    if (routine == GSS_S_BAD_MIC)              return KRB5_ERR_GSS_BAD_MIC;
+#endif
+    if (routine == GSS_S_BAD_SIG)              return KRB5_ERR_GSS_BAD_MIC;
+
+    /*
+     * Mech-specific minor: walk the GSS message context until we get
+     * a string we can recognise, or until display_status reports
+     * GSS_S_COMPLETE with no further messages.
+     */
+    OM_uint32           ms;
+    OM_uint32           message_context = 0;
+    enum krb5_error_code matched = KRB5_ERR_GSS_INIT_FAILED;
+
+    do {
+        gss_buffer_desc msg = GSS_C_EMPTY_BUFFER;
+        OM_uint32 dms = gss_display_status(&ms, min, GSS_C_MECH_CODE,
+                                           mech, &message_context, &msg);
+        if (GSS_ERROR(dms))
+            break;
+
+        const char *s = (const char *)msg.value;
+        if (s) {
+            /*
+             * Order matters: more specific patterns first so the
+             * generic INTEGRITY catch doesn't shadow KVNO.
+             */
+            if (strstr(s, "lock skew")) {
+                matched = KRB5_ERR_CLOCK_SKEW;
+            } else if (strstr(s, "Cannot find KDC") ||
+                       strstr(s, "Cannot contact any KDC") ||
+                       strstr(s, "Connection refused")) {
+                matched = KRB5_ERR_KDC_UNREACHABLE;
+            } else if (strstr(s, "No credentials cache") ||
+                       strstr(s, "credentials cache file") ||
+                       strstr(s, "No such file or directory")) {
+                matched = KRB5_ERR_NO_TGT;
+            } else if (strstr(s, "icket expired")) {
+                matched = KRB5_ERR_TGT_EXPIRED;
+            } else if (strstr(s, "ot yet valid")) {
+                matched = KRB5_ERR_TGT_NOT_YET_VALID;
+            } else if (strstr(s, "key table entry not found") ||
+                       strstr(s, "Key table entry not found") ||
+                       strstr(s, "no suitable keys")) {
+                matched = KRB5_ERR_KEYTAB_NO_PRINCIPAL;
+            } else if (strstr(s, "ey version") &&
+                       (strstr(s, "not available") ||
+                        strstr(s, "wrong"))) {
+                matched = KRB5_ERR_BAD_KVNO;
+            } else if (strstr(s, "Decrypt integrity check") ||
+                       strstr(s, "decrypt integrity") ||
+                       strstr(s, "BAD_INTEGRITY")) {
+                matched = KRB5_ERR_BAD_INTEGRITY;
+            } else if (strstr(s, "Server") && strstr(s, "not found in")) {
+                matched = KRB5_ERR_PRINCIPAL_UNKNOWN;
+            } else if (strstr(s, "ncryption type") &&
+                       strstr(s, "supported")) {
+                matched = KRB5_ERR_BAD_ENCTYPE;
+            } else if (strstr(s, "Permission denied") &&
+                       strstr(s, "keytab")) {
+                matched = KRB5_ERR_KEYTAB_NOT_READABLE;
+            } else if (strstr(s, "Pre-authentication failed") ||
+                       strstr(s, "PREAUTH_FAILED")) {
+                matched = KRB5_ERR_PREAUTH_FAILED;
+            } else if (strstr(s, "not in the same realm") ||
+                       strstr(s, "BAD_REALM")) {
+                matched = KRB5_ERR_BAD_REALM;
+            }
+        }
+        gss_release_buffer(&ms, &msg);
+
+        if (matched != KRB5_ERR_GSS_INIT_FAILED)
+            break;
+    } while (message_context != 0);
+
+    return matched;
+}
+
+/*
+ * krb5_emit_gss_failure -- pretty-print a GSS failure via the canonical
+ * taxonomy and return the symbolic code's numeric value (for use as
+ * the program exit status).
+ *
+ * Builds a context line from the operation name and the raw GSS
+ * major/minor pair so the user can still recognise the failure if
+ * the classifier picked the wrong category.
+ */
+static int krb5_emit_gss_failure(const char *operation,
+                                 OM_uint32 maj, OM_uint32 min, gss_OID mech)
+{
+    enum krb5_error_code code = krb5_classify_gss(maj, min, mech);
+    char ctx[128];
+    snprintf(ctx, sizeof(ctx),
+             "%s: maj=0x%08x min=0x%08x", operation, maj, min);
+    nfs_error_emit_one(stderr, (int)code, ctx);
+    return (int)code;
+}
+
+/* -----------------------------------------------------------------------
  * Option parsing
  * --------------------------------------------------------------------- */
 
@@ -529,34 +671,49 @@ struct options {
     const char *o_principal;
     long        o_iterations;
     int         o_verbose;
+    int         o_diagnose;          /* run pre-flight checks and exit */
+    int         o_print_error_table; /* dump krb5 error taxonomy and exit */
 };
 
 static void usage(const char *prog)
 {
     fprintf(stderr,
             "Usage: %s --host HOST [options]\n"
+            "       %s --diagnose\n"
+            "       %s --print-error-table\n"
             "\n"
             "Options:\n"
-            "  --host HOST         NFS server hostname or IP (required)\n"
-            "  --port PORT         Port number (default: 2049)\n"
-            "  --principal NAME    Service principal (default: nfs@HOST)\n"
-            "  --iterations N      NULL calls after context setup (default: 1)\n"
-            "  --verbose           Show GSS exchange details\n"
+            "  --host HOST           NFS server hostname or IP\n"
+            "  --port PORT           Port number (default: 2049)\n"
+            "  --principal NAME      Service principal (default: nfs@HOST)\n"
+            "  --iterations N        NULL calls after context setup (default: 1)\n"
+            "  --verbose             Show GSS exchange details\n"
+            "\n"
+            "Diagnostic options:\n"
+            "  --diagnose            Run local pre-flight krb5 checks and exit\n"
+            "  --print-error-table   Print the krb5 error taxonomy and exit\n"
             "\n"
             "Tests RPCSEC_GSS (RFC 2203) Kerberos 5 context establishment and\n"
-            "authenticated NULL RPC calls against an NFS server.\n",
-            prog);
+            "authenticated NULL RPC calls against an NFS server.\n"
+            "\n"
+            "Exit status uses the canonical krb5 error taxonomy: 0 on success,\n"
+            "100..199 for the dominant failure class, 250 (MIXED) if more than\n"
+            "one class fails in the same run.  Run --print-error-table for\n"
+            "the full code list.\n",
+            prog, prog, prog);
     exit(EXIT_FAILURE);
 }
 
 static void parse_options(int argc, char **argv, struct options *o)
 {
     static const struct option long_opts[] = {
-        { "host",       required_argument, NULL, 'H' },
-        { "port",       required_argument, NULL, 'p' },
-        { "principal",  required_argument, NULL, 'P' },
-        { "iterations", required_argument, NULL, 'i' },
-        { "verbose",    no_argument,       NULL, 'v' },
+        { "host",             required_argument, NULL, 'H' },
+        { "port",             required_argument, NULL, 'p' },
+        { "principal",        required_argument, NULL, 'P' },
+        { "iterations",       required_argument, NULL, 'i' },
+        { "verbose",          no_argument,       NULL, 'v' },
+        { "diagnose",         no_argument,       NULL, 'D' },
+        { "print-error-table",no_argument,       NULL, 'E' },
         { NULL, 0, NULL, 0 }
     };
 
@@ -567,14 +724,21 @@ static void parse_options(int argc, char **argv, struct options *o)
     int ch;
     while ((ch = getopt_long(argc, argv, "", long_opts, NULL)) != -1) {
         switch (ch) {
-        case 'H': o->o_host       = optarg;       break;
-        case 'p': o->o_port       = optarg;       break;
-        case 'P': o->o_principal  = optarg;       break;
-        case 'i': o->o_iterations = atol(optarg); break;
-        case 'v': o->o_verbose    = 1;            break;
+        case 'H': o->o_host             = optarg;       break;
+        case 'p': o->o_port             = optarg;       break;
+        case 'P': o->o_principal        = optarg;       break;
+        case 'i': o->o_iterations       = atol(optarg); break;
+        case 'v': o->o_verbose          = 1;            break;
+        case 'D': o->o_diagnose         = 1;            break;
+        case 'E': o->o_print_error_table = 1;           break;
         default:  usage(argv[0]);
         }
     }
+
+    /* --diagnose and --print-error-table run without a host */
+    if (o->o_diagnose || o->o_print_error_table)
+        return;
+
     if (!o->o_host) {
         fprintf(stderr, "Error: --host is required\n\n");
         usage(argv[0]);
@@ -589,6 +753,22 @@ int main(int argc, char **argv)
 {
     struct options opts;
     parse_options(argc, argv, &opts);
+
+    /* Register the krb5 error table into the cross-domain registry
+     * before any nfs_error_emit_one or nfs_error_lookup is called. */
+    krb5_error_init();
+
+    /* --diagnose: run pre-flight krb5 checks and exit. */
+    if (opts.o_diagnose) {
+        diag_init_krb5();
+        return diag_run(DIAG_DOMAIN_KRB5);
+    }
+
+    /* --print-error-table: dump the canonical krb5 taxonomy and exit. */
+    if (opts.o_print_error_table) {
+        nfs_error_print_table("krb5");
+        return NFS_ERR_OK;
+    }
 
     /* Build default principal "nfs@HOST" if not specified */
     char default_principal[512];
@@ -605,8 +785,12 @@ int main(int argc, char **argv)
     char errbuf[512];
     int fd = tcp_connect_host(opts.o_host, opts.o_port, errbuf, sizeof(errbuf));
     if (fd < 0) {
+        /* TCP-level failure is not part of the krb5 taxonomy proper;
+         * report verbosely and use NFS_ERR_INTERNAL as the exit code
+         * so callers can still distinguish "before krb5 even started"
+         * from "krb5 classified failure". */
         fprintf(stderr, "connect: %s\n", errbuf);
-        return EXIT_FAILURE;
+        return NFS_ERR_INTERNAL;
     }
 
     /* --- GSS context establishment --- */
@@ -624,10 +808,11 @@ int main(int argc, char **argv)
                                 GSS_C_NT_HOSTBASED_SERVICE,
                                 &gc.gc_svc_name);
     if (maj_stat != GSS_S_COMPLETE) {
-        fprintf(stderr, "gss_import_name('%s'): maj=%u min=%u\n",
-                opts.o_principal, maj_stat, min_stat);
+        int code = krb5_emit_gss_failure("gss_import_name",
+                                         maj_stat, min_stat,
+                                         GSS_C_NO_OID);
         close(fd);
-        return EXIT_FAILURE;
+        return code;
     }
     if (opts.o_verbose)
         printf("  gss_import_name OK\n");
@@ -667,12 +852,13 @@ int main(int argc, char **argv)
 
         if (maj_stat != GSS_S_COMPLETE &&
             maj_stat != GSS_S_CONTINUE_NEEDED) {
-            fprintf(stderr, "gss_init_sec_context: maj=%u min=%u\n",
-                    maj_stat, min_stat);
+            int code = krb5_emit_gss_failure("gss_init_sec_context",
+                                             maj_stat, min_stat,
+                                             gc.gc_mech);
             gss_release_buffer(&min_stat, &out_token);
             gss_release_name(&min_stat, &gc.gc_svc_name);
             close(fd);
-            return EXIT_FAILURE;
+            return code;
         }
 
         if (opts.o_verbose)
@@ -689,36 +875,48 @@ int main(int argc, char **argv)
             gss_release_buffer(&min_stat, &out_token);
 
             if (call_len == 0) {
-                fprintf(stderr, "build_gss_init_call: buffer overflow\n");
+                /* Build-side overflow is a tool bug, not a krb5
+                 * problem -- emit INTERNAL and bail. */
+                nfs_error_emit_one(stderr, NFS_ERR_INTERNAL,
+                                   "build_gss_init_call: buffer overflow");
                 gss_release_name(&min_stat, &gc.gc_svc_name);
                 close(fd);
-                return EXIT_FAILURE;
+                return NFS_ERR_INTERNAL;
             }
             if (rpc_writen(fd, call_buf, call_len) != (ssize_t)call_len) {
+                /* TCP write failure mid-handshake -- transport error,
+                 * not a krb5 classification.  Use INTERNAL. */
                 fprintf(stderr, "write INIT call: %s\n", strerror(errno));
                 gss_release_name(&min_stat, &gc.gc_svc_name);
                 close(fd);
-                return EXIT_FAILURE;
+                return NFS_ERR_INTERNAL;
             }
 
             /* Read INIT reply */
             ssize_t rlen = read_rpc_reply(fd, reply_buf, sizeof(reply_buf),
                                            errbuf, sizeof(errbuf));
             if (rlen < 0) {
-                fprintf(stderr, "read INIT reply: %s\n", errbuf);
+                /* Server hung up or short read -- typically a krb5
+                 * rejection that the server didn't send a structured
+                 * RPCSEC_GSS reject for.  Tag it as RPCSEC_GSS_FAILED. */
+                nfs_error_emit_one(stderr, KRB5_ERR_RPCSEC_GSS_FAILED,
+                                   errbuf);
                 gss_release_name(&min_stat, &gc.gc_svc_name);
                 close(fd);
-                return EXIT_FAILURE;
+                return KRB5_ERR_RPCSEC_GSS_FAILED;
             }
 
             int done = parse_gss_init_reply(reply_buf, (size_t)rlen, xid,
                                              &gc, &in_token, errbuf,
                                              sizeof(errbuf));
             if (done < 0) {
-                fprintf(stderr, "parse INIT reply: %s\n", errbuf);
+                /* Reply parsed but not as a valid RPCSEC_GSS resok --
+                 * server returned an RPC reject or a malformed body. */
+                nfs_error_emit_one(stderr, KRB5_ERR_RPCSEC_BAD_CRED,
+                                   errbuf);
                 gss_release_name(&min_stat, &gc.gc_svc_name);
                 close(fd);
-                return EXIT_FAILURE;
+                return KRB5_ERR_RPCSEC_BAD_CRED;
             }
             if (opts.o_verbose)
                 printf("  INIT reply: handle_len=%u done=%d\n",
@@ -736,35 +934,53 @@ int main(int argc, char **argv)
     printf("  RPCSEC_GSS context established (handle_len=%u)\n",
            gc.gc_handle_len);
 
-    /* --- DATA NULL calls --- */
-    int result = EXIT_SUCCESS;
+    /* --- DATA NULL calls ---
+     *
+     * Track the canonical exit code: NFS_ERR_OK on full success, the
+     * symbolic code of the failing iteration otherwise.  We bail on
+     * the first failure (single-threaded sequential test), so MIXED
+     * is not currently reachable here -- but we keep the variable
+     * shape consistent with nfs_tls_test for future stress mode.
+     */
+    int result_code = NFS_ERR_OK;
     for (long i = 0; i < opts.o_iterations; i++) {
         xid++;
         size_t call_len = build_gss_data_null(call_buf, sizeof(call_buf),
                                                xid, NFS_PROGRAM, NFS_VERSION_4,
                                                &gc, errbuf, sizeof(errbuf));
         if (call_len == 0) {
-            fprintf(stderr, "build_gss_data_null: %s\n", errbuf);
-            result = EXIT_FAILURE;
+            /* gss_get_mic over the call header failed -- typically a
+             * dead context. */
+            nfs_error_emit_one(stderr, KRB5_ERR_GSS_CONTEXT_EXPIRED,
+                               errbuf);
+            result_code = KRB5_ERR_GSS_CONTEXT_EXPIRED;
             break;
         }
         if (rpc_writen(fd, call_buf, call_len) != (ssize_t)call_len) {
             fprintf(stderr, "write DATA NULL: %s\n", strerror(errno));
-            result = EXIT_FAILURE;
+            result_code = NFS_ERR_INTERNAL;
             break;
         }
 
         ssize_t rlen = read_rpc_reply(fd, reply_buf, sizeof(reply_buf),
                                        errbuf, sizeof(errbuf));
         if (rlen < 0) {
-            fprintf(stderr, "read DATA reply: %s\n", errbuf);
-            result = EXIT_FAILURE;
+            /* Server dropped the connection or returned a structured
+             * RPCSEC_GSS reject mid-stream -- the most common cause
+             * is RPCSEC_GSS_CTXPROBLEM under load.  Use that as the
+             * default classification. */
+            nfs_error_emit_one(stderr, KRB5_ERR_RPCSEC_CTXPROBLEM,
+                               errbuf);
+            result_code = KRB5_ERR_RPCSEC_CTXPROBLEM;
             break;
         }
         if (parse_data_reply_verifier(reply_buf, (size_t)rlen, xid,
                                        &gc, errbuf, sizeof(errbuf)) < 0) {
-            fprintf(stderr, "verify DATA reply: %s\n", errbuf);
-            result = EXIT_FAILURE;
+            /* Reply verifier (server's MIC) failed gss_verify_mic --
+             * either the server's MIC is bad or our context state
+             * has drifted. */
+            nfs_error_emit_one(stderr, KRB5_ERR_GSS_BAD_MIC, errbuf);
+            result_code = KRB5_ERR_GSS_BAD_MIC;
             break;
         }
         if (opts.o_verbose)
@@ -782,10 +998,10 @@ int main(int argc, char **argv)
         free(in_token.value);
     close(fd);
 
-    if (result == EXIT_SUCCESS)
+    if (result_code == NFS_ERR_OK)
         printf("PASS\n");
     else
         printf("FAIL\n");
 
-    return result;
+    return result_code;
 }
