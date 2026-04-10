@@ -32,6 +32,7 @@ bin_PROGRAMS += nfs_krb5_test
 
 nfs_krb5_test_SOURCES = \
 	nfs_krb5_test.c \
+	gss_wire.c \
 	nfs_error.c \
 	krb5_error.c \
 	diag.c \

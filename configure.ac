@@ -33,7 +33,7 @@ AC_SUBST([GSSAPI_CFLAGS])
 AC_SUBST([GSSAPI_LIBS])
 AM_CONDITIONAL([HAVE_GSSAPI], [test "x$have_gssapi" = xyes])
 
-AC_CONFIG_FILES([Makefile src/Makefile])
+AC_CONFIG_FILES([Makefile src/Makefile tests/Makefile])
 AC_OUTPUT
 
 echo ""
