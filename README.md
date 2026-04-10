@@ -264,6 +264,43 @@ by downstream CI tooling without scraping the ASCII format.
 
 ---
 
+## nfs_tls_server
+
+A minimal RFC 9289 STARTTLS server for testing client implementations.
+Listens on a TCP port, accepts AUTH_TLS NULL probes, performs the
+TLS handshake with ALPN `sunrpc`, and replies to NULL RPCs over the
+encrypted channel.
+
+This is the mirror of `nfs_tls_test` on the server side: instead of
+driving connections at a server, it accepts connections from a client
+being tested.  Useful for verifying RFC 9289 client implementations
+(`tlshd`, FreeBSD `rpc.tlsclntd`, custom user-space clients) without
+needing a full NFS server stack.
+
+```bash
+# Generate a self-signed cert for the server
+openssl req -x509 -newkey rsa:4096 \
+  -keyout /tmp/server.key -out /tmp/server.pem \
+  -days 30 -nodes -subj "/CN=test-server" \
+  -addext "subjectAltName=IP:127.0.0.1,DNS:localhost"
+
+# Run the server
+./nfs_tls_server --cert /tmp/server.pem --key /tmp/server.key \
+                 --port 12049 --verbose
+
+# In another shell, test it with the client
+./nfs_tls_test --host 127.0.0.1 --port 12049 \
+               --ca-cert /tmp/server.pem --tls-info
+```
+
+For mutual TLS, supply `--ca-cert` and optionally `--require-mtls`.
+
+The server is single-threaded by design -- one client at a time --
+to keep it trivially debuggable and avoid concurrency complexity in
+a tool whose job is to expose protocol conformance bugs.
+
+---
+
 ## nfs_cert_info
 
 A standalone certificate validation tool: load a PEM cert (and
