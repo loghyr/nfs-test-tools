@@ -1,19 +1,32 @@
 /* SPDX-FileCopyrightText: 2026 Tom Haynes <loghyr@gmail.com> */
 /* SPDX-License-Identifier: Apache-2.0 */
 /*
- * tls_error.c -- canonical NFS-over-TLS failure taxonomy table.
+ * tls_error.c -- canonical NFS-over-TLS failure taxonomy.
  *
- * The single source of truth for failure descriptors.  Both the tool's
- * runtime error reporting and the documentation's "Common Errors"
- * table read from this same array, so they cannot drift out of sync.
+ * Holds the TLS-domain entries that get registered into the generic
+ * registry in nfs_error.c.  This file is the single source of truth
+ * for TLS failure descriptors; the runtime error reporting and the
+ * troubleshooting documentation both read from this same array, so
+ * they cannot drift out of sync.
+ *
+ * To add a new failure mode:
+ *   1. Add an entry to enum tls_error_code in tls_error.h with a
+ *      stable numeric value (gaps of 1 within a phase, gaps of 10
+ *      between phases).
+ *   2. Add a descriptor to s_tls_entries[] below with a doc anchor.
+ *   3. Add a `### <symbol>` subsection to TROUBLESHOOTING.md whose
+ *      anchor matches the doc_anchor field.
  */
 
 #include "tls_error.h"
 
-#include <stdio.h>
 #include <stddef.h>
 
-static const char *s_phase_names[TLS_PHASE_NUM] = {
+/*
+ * TLS phase names, indexed by enum tls_phase.  The registry resolves
+ * an entry's phase via this array.
+ */
+static const char *const s_tls_phase_names[TLS_PHASE_NUM] = {
     [TLS_PHASE_PRE_FLIGHT] = "pre-flight",
     [TLS_PHASE_TCP]        = "tcp",
     [TLS_PHASE_PROBE]      = "probe",
@@ -21,18 +34,12 @@ static const char *s_phase_names[TLS_PHASE_NUM] = {
     [TLS_PHASE_RPC]        = "rpc",
 };
 
-const char *tls_error_phase_name(enum tls_phase phase)
-{
-    if ((unsigned)phase >= TLS_PHASE_NUM)
-        return "?";
-    return s_phase_names[phase];
-}
-
 /*
- * Canonical taxonomy.  When adding a new error mode, add the entry
- * here and the runtime detector and the doc both pick it up.
+ * Canonical TLS taxonomy.  When adding a new error mode, add the
+ * entry here and the runtime detector and the doc both pick it up
+ * via the doc_anchor.
  */
-static const struct tls_error_info s_table[] = {
+static const struct nfs_error_info s_tls_entries[] = {
     /* Pre-flight */
     { TLS_ERR_KERNEL_TOO_OLD,        TLS_PHASE_PRE_FLIGHT,
       "KERNEL_TOO_OLD",
@@ -210,7 +217,9 @@ static const struct tls_error_info s_table[] = {
       "TLS_RX_EXPECT_NO_PAD mis-prediction; usually benign",
       "ktls_no_pad_violation" },
 
-    /* Aggregate */
+    /* Aggregate.  Phase = TLS_PHASE_NUM (out of range) so the phase
+     * column renders as "?" -- these are not associated with any
+     * single phase. */
     { TLS_ERR_MIXED,                 TLS_PHASE_NUM,
       "MIXED",
       "Multiple distinct failure classes occurred in one run",
@@ -224,75 +233,42 @@ static const struct tls_error_info s_table[] = {
       "internal" },
 };
 
-#define N_ENTRIES (sizeof(s_table) / sizeof(s_table[0]))
+#define N_TLS_ENTRIES (sizeof(s_tls_entries) / sizeof(s_tls_entries[0]))
 
-const struct tls_error_info *tls_error_lookup(enum tls_error_code code)
+static const struct nfs_error_table s_tls_table = {
+    .domain      = "tls",
+    .entries     = s_tls_entries,
+    .n_entries   = N_TLS_ENTRIES,
+    .phase_names = s_tls_phase_names,
+    .n_phases    = TLS_PHASE_NUM,
+};
+
+void tls_error_init(void)
 {
-    for (size_t i = 0; i < N_ENTRIES; i++) {
-        if (s_table[i].code == code)
-            return &s_table[i];
-    }
-    return NULL;
+    nfs_error_register(&s_tls_table);
+}
+
+/* ----- Backward-compatible wrappers ------------------------------ */
+
+const struct nfs_error_info *tls_error_lookup(enum tls_error_code code)
+{
+    return nfs_error_lookup((int)code, NULL);
+}
+
+const char *tls_error_phase_name(enum tls_phase phase)
+{
+    return nfs_error_phase_name(&s_tls_table, (int)phase);
 }
 
 void tls_error_print_table(void)
 {
-    /*
-     * Output a markdown table suitable for inclusion in
-     * TROUBLESHOOTING.md.  Columns: code, symbol, phase, description,
-     * fix, doc anchor.
-     */
-    printf("| Code | Symbol | Phase | Description | Fix | See |\n");
-    printf("|------|--------|-------|-------------|-----|-----|\n");
-    for (size_t i = 0; i < N_ENTRIES; i++) {
-        const struct tls_error_info *e = &s_table[i];
-        printf("| %d | `%s` | %s | %s | %s | "
-               "[#%s](#%s) |\n",
-               (int)e->code, e->symbol,
-               tls_error_phase_name(e->phase),
-               e->description, e->suggestion,
-               e->doc_anchor ? e->doc_anchor : "",
-               e->doc_anchor ? e->doc_anchor : "");
-    }
+    nfs_error_print_table("tls");
 }
 
-/*
- * tls_error_emit_one -- pretty-print a single error to f.
- *
- * Format (approximate):
- *
- *   [ERROR CERT_EXPIRED]  (42 failures)
- *       Server certificate has expired
- *       Fix: Renew the server certificate
- *       See: TROUBLESHOOTING.md#cert_expired
- *
- * If code is unknown the line is rendered with a "?" symbol so callers
- * never crash on a stale code in the wild.
- */
 void tls_error_emit_one(FILE *f, enum tls_error_code code,
                         const char *context)
 {
-    const struct tls_error_info *e = tls_error_lookup(code);
-
-    if (!f)
-        f = stderr;
-
-    if (!e) {
-        fprintf(f, "[ERROR ?]  (code=%d, no descriptor)\n", (int)code);
-        return;
-    }
-
-    if (context && *context)
-        fprintf(f, "[ERROR %s]  (%s)\n", e->symbol, context);
-    else
-        fprintf(f, "[ERROR %s]\n", e->symbol);
-
-    fprintf(f, "    %s\n", e->description);
-    fprintf(f, "    Fix: %s\n", e->suggestion);
-    if (e->doc_anchor && *e->doc_anchor)
-        fprintf(f, "    See: TROUBLESHOOTING.md#%s\n", e->doc_anchor);
-    else
-        fprintf(f, "    See: TROUBLESHOOTING.md\n");
+    nfs_error_emit_one(f, (int)code, context);
 }
 
 enum tls_error_code tls_error_default_for_phase(enum tls_phase phase)

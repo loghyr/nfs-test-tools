@@ -7,6 +7,7 @@ nfs_tls_test_SOURCES = \
 	nfs_tls_test.c \
 	tls_client.c \
 	tls_stat.c \
+	nfs_error.c \
 	tls_error.c \
 	diagnose.c
 

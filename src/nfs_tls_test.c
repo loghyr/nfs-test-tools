@@ -877,6 +877,10 @@ int main(int argc, char **argv)
     struct options o;
     parse_options(argc, argv, &o);
 
+    /* Register the TLS error table into the cross-domain registry
+     * before any tls_error_* lookup or emit can fire. */
+    tls_error_init();
+
     /* --diagnose: run pre-flight checks and exit before anything else */
     if (o.o_diagnose)
         return diagnose_run();
