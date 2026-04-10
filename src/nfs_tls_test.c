@@ -33,6 +33,8 @@
 
 #include "tls_client.h"
 #include "stats.h"
+#include "tls_stat.h"
+#include "diagnose.h"
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -68,6 +70,13 @@ struct options {
     const char *o_ca_cert;
     const char *o_cert;
     const char *o_key;
+    /* New in v3 */
+    const char *o_keylog;          /* path to NSS keylog file, or NULL */
+    const char *o_check_san;       /* required SAN list, or NULL */
+    int         o_snapshot_stats;  /* 1 = read /proc/net/tls_stat before/after */
+    int         o_diagnose;        /* 1 = run diagnose_run() and exit */
+    int         o_require_tls13;   /* 1 = treat TLS 1.2 as FAIL not WARN */
+    const char *o_require_alpn;    /* required ALPN protocol, or NULL */
 };
 
 /* --- per-worker state --- */
@@ -200,6 +209,62 @@ static void *worker_thread(void *arg)
                     &g_tls_info_printed, &expected, 1,
                     memory_order_acq_rel, memory_order_relaxed)) {
                 tls_conn_print_info(&conn);
+                char alpn[64];
+                if (tls_conn_get_alpn(&conn, alpn, sizeof(alpn)) > 0)
+                    printf("ALPN: %s\n", alpn);
+            }
+        }
+
+        /* Optional --check-san: verify peer cert SAN contains the
+         * required entries.  Counted as a handshake-phase failure. */
+        if (o->o_check_san) {
+            if (tls_conn_check_san(&conn, o->o_check_san,
+                                   errbuf, sizeof(errbuf)) < 0) {
+                atomic_fetch_add_explicit(&w->w_fail_handshake, 1,
+                                          memory_order_relaxed);
+                if (o->o_verbose && o->o_threads == 1)
+                    printf("  [%4ld] SAN FAIL: %s\n", iter + 1, errbuf);
+                else
+                    fprintf(stderr, "worker %d iter %ld: %s\n",
+                            w->w_id, iter + 1, errbuf);
+                tls_conn_close(&conn);
+                iter++;
+                continue;
+            }
+        }
+
+        /* Optional --require-tls13: anything below TLS 1.3 is a hard fail */
+        if (o->o_require_tls13) {
+            const char *ver = tls_conn_get_version(&conn);
+            if (strcmp(ver, "TLSv1.3") != 0) {
+                snprintf(errbuf, sizeof(errbuf),
+                         "TLS version %s below required TLSv1.3", ver);
+                atomic_fetch_add_explicit(&w->w_fail_handshake, 1,
+                                          memory_order_relaxed);
+                if (o->o_verbose && o->o_threads == 1)
+                    printf("  [%4ld] TLS-VERSION FAIL: %s\n",
+                           iter + 1, errbuf);
+                tls_conn_close(&conn);
+                iter++;
+                continue;
+            }
+        }
+
+        /* Optional --require-alpn: enforce a specific ALPN protocol */
+        if (o->o_require_alpn) {
+            char alpn[64];
+            tls_conn_get_alpn(&conn, alpn, sizeof(alpn));
+            if (strcmp(alpn, o->o_require_alpn) != 0) {
+                snprintf(errbuf, sizeof(errbuf),
+                         "ALPN '%s' does not match required '%s'",
+                         alpn, o->o_require_alpn);
+                atomic_fetch_add_explicit(&w->w_fail_handshake, 1,
+                                          memory_order_relaxed);
+                if (o->o_verbose && o->o_threads == 1)
+                    printf("  [%4ld] ALPN FAIL: %s\n", iter + 1, errbuf);
+                tls_conn_close(&conn);
+                iter++;
+                continue;
             }
         }
 
@@ -319,9 +384,10 @@ static void usage(const char *prog)
 {
     fprintf(stderr,
         "Usage: %s --host HOST [options]\n"
+        "       %s --diagnose\n"
         "\n"
-        "Options:\n"
-        "  --host HOST           NFS server hostname or IP (required)\n"
+        "Connection options:\n"
+        "  --host HOST           NFS server hostname or IP\n"
         "  --port PORT           Port number (default: 2049)\n"
         "  --iterations N        Number of connections per thread (default: 10)\n"
         "  --ca-cert FILE        CA certificate PEM (skip verify if absent)\n"
@@ -329,18 +395,31 @@ static void usage(const char *prog)
         "  --key FILE            Client private key PEM (mutual TLS)\n"
         "  --no-null             Skip post-handshake NULL RPC\n"
         "  --verbose             Print per-connection result (single-thread only)\n"
+        "\n"
+        "Stress options:\n"
         "  --threads N           Concurrent worker threads (default: 1)\n"
         "  --duration N          Run for N seconds (overrides --iterations)\n"
         "  --calls-per-conn N    NULL RPCs per TLS connection (default: 1)\n"
         "  --no-session-reuse    Force full TLS handshake each time\n"
         "  --rate N              Target conn/s total (default: unlimited)\n"
         "  --progress N          Progress interval seconds (default: 10; 0=off)\n"
-        "  --tls-info            Print negotiated TLS version/cipher\n"
+        "\n"
+        "Reporting:\n"
+        "  --tls-info            Print negotiated TLS version/cipher/ALPN\n"
         "  --histogram           Print ASCII latency histogram\n"
+        "  --snapshot-stats      Read /proc/net/tls_stat before/after run\n"
+        "\n"
+        "Diagnostic and strict-mode options:\n"
+        "  --diagnose            Run local pre-flight checks and exit\n"
+        "  --keylog FILE         Write NSS-format TLS key log for Wireshark\n"
+        "  --check-san LIST      Verify server cert SAN includes these entries\n"
+        "                        (comma-separated 'IP:...,DNS:...')\n"
+        "  --require-tls13       Treat anything below TLS 1.3 as a failure\n"
+        "  --require-alpn NAME   Require this ALPN protocol (default: 'sunrpc')\n"
         "\n"
         "Tests RFC 9289 RPC-over-TLS (STARTTLS): AUTH_TLS probe, TLS handshake,\n"
         "ALPN 'sunrpc' verification, optional NFS NULL call over TLS.\n",
-        prog);
+        prog, prog);
     exit(EXIT_FAILURE);
 }
 
@@ -363,6 +442,12 @@ static void parse_options(int argc, char **argv, struct options *o)
         { "progress",         required_argument, NULL, 'P' },
         { "tls-info",         no_argument,       NULL, 'I' },
         { "histogram",        no_argument,       NULL, 'A' },
+        { "keylog",           required_argument, NULL, 'L' },
+        { "check-san",        required_argument, NULL, 'S' },
+        { "snapshot-stats",   no_argument,       NULL, 'T' },
+        { "diagnose",         no_argument,       NULL, 'D' },
+        { "require-tls13",    no_argument,       NULL, '3' },
+        { "require-alpn",     required_argument, NULL, 'N' },
         { NULL, 0, NULL, 0 }
     };
 
@@ -392,10 +477,20 @@ static void parse_options(int argc, char **argv, struct options *o)
         case 'P': o->o_progress       = atoi(optarg);   break;
         case 'I': o->o_tls_info       = 1;              break;
         case 'A': o->o_histogram      = 1;              break;
+        case 'L': o->o_keylog         = optarg;         break;
+        case 'S': o->o_check_san      = optarg;         break;
+        case 'T': o->o_snapshot_stats = 1;              break;
+        case 'D': o->o_diagnose       = 1;              break;
+        case '3': o->o_require_tls13  = 1;              break;
+        case 'N': o->o_require_alpn   = optarg;         break;
         default:
             usage(argv[0]);
         }
     }
+
+    /* --diagnose runs without a host */
+    if (o->o_diagnose)
+        return;
 
     if (!o->o_host) {
         fprintf(stderr, "Error: --host is required\n\n");
@@ -580,11 +675,29 @@ int main(int argc, char **argv)
     struct options o;
     parse_options(argc, argv, &o);
 
+    /* --diagnose: run pre-flight checks and exit before anything else */
+    if (o.o_diagnose)
+        return diagnose_run();
+
     SSL_CTX *ctx = tls_ctx_create(o.o_ca_cert, o.o_cert, o.o_key);
     if (!ctx) {
         fprintf(stderr, "Failed to create TLS context\n");
         return EXIT_FAILURE;
     }
+
+    /* Optional NSS-format keylog for Wireshark decryption */
+    if (o.o_keylog) {
+        if (tls_ctx_enable_keylog(ctx, o.o_keylog) < 0) {
+            SSL_CTX_free(ctx);
+            return EXIT_FAILURE;
+        }
+        printf("TLS keylog: writing session keys to %s\n", o.o_keylog);
+    }
+
+    /* Optional /proc/net/tls_stat snapshot before the test */
+    struct tls_stat ts_before, ts_after;
+    if (o.o_snapshot_stats)
+        tls_stat_snapshot(&ts_before);
 
     int nworkers = o.o_threads;
 
@@ -682,8 +795,17 @@ int main(int argc, char **argv)
         pthread_join(progress_tid, NULL);
     }
 
+    /* Snapshot kTLS counters after the run, before printing the report */
+    if (o.o_snapshot_stats)
+        tls_stat_snapshot(&ts_after);
+
     /* Print final report */
     print_report(&o, workers, nworkers, elapsed_ms);
+
+    /* Print kTLS counter deltas if requested */
+    int ktls_errors = 0;
+    if (o.o_snapshot_stats)
+        ktls_errors = tls_stat_diff_print(&ts_before, &ts_after);
 
     /* Non-zero exit if any failures -- read before freeing workers */
     long total_fail = 0;
@@ -706,5 +828,6 @@ int main(int argc, char **argv)
     free(workers);
     SSL_CTX_free(ctx);
 
-    return (total_fail == 0) ? EXIT_SUCCESS : EXIT_FAILURE;
+    return (total_fail == 0 && ktls_errors == 0)
+           ? EXIT_SUCCESS : EXIT_FAILURE;
 }

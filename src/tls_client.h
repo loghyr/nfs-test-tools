@@ -63,6 +63,22 @@ SSL_CTX *tls_ctx_create(const char *ca_cert, const char *cert,
                         const char *key);
 
 /*
+ * tls_ctx_enable_keylog -- enable SSLKEYLOGFILE-style key logging.
+ *
+ * Sets a keylog callback on the SSL_CTX that appends NSS key-log lines
+ * (CLIENT_HANDSHAKE_TRAFFIC_SECRET, etc.) to the file at keylog_path.
+ * The file is opened in append mode and remains open for the lifetime
+ * of the context; callers should not delete the file mid-run.
+ *
+ * Wireshark / tshark can import this file via
+ *   Edit -> Preferences -> Protocols -> TLS -> (Pre)-Master-Secret log
+ * or via `tshark -o tls.keylog_file:PATH` to decrypt captures.
+ *
+ * Returns 0 on success, -1 on error (errors logged to stderr).
+ */
+int tls_ctx_enable_keylog(SSL_CTX *ctx, const char *keylog_path);
+
+/*
  * tls_connect_starttls -- connect to host:port, perform RFC 9289 STARTTLS.
  *
  * Sends a NULL RPC call with AUTH_TLS credential, reads the reply, then
@@ -118,6 +134,40 @@ SSL_SESSION *tls_conn_get_session(struct tls_conn *conn);
  * exchange group to stdout.  Call after a successful tls_connect_starttls().
  */
 void tls_conn_print_info(const struct tls_conn *conn);
+
+/*
+ * tls_conn_check_san -- verify required SAN entries are present in the
+ * server's leaf certificate.
+ *
+ * Parses required as a comma-separated list of "IP:value" or "DNS:value"
+ * (or bare values, which are tried as both).  Walks the server's
+ * subjectAltName extension and confirms every required entry is present.
+ *
+ * Call after a successful handshake but before tls_conn_close().
+ *
+ * conn     : open TLS connection
+ * required : comma-separated list, e.g. "IP:10.0.0.1,DNS:nfs.example.com"
+ * errbuf   : caller buffer; filled with the first missing entry on failure
+ * errsz    : size of errbuf
+ *
+ * Returns 0 if all required entries are present, -1 if any are missing
+ * or the cert lacks a SAN extension entirely.
+ */
+int tls_conn_check_san(const struct tls_conn *conn, const char *required,
+                       char *errbuf, size_t errsz);
+
+/*
+ * tls_conn_get_alpn -- copy the negotiated ALPN protocol into buf.
+ * Returns the number of bytes written (excluding NUL), 0 if no ALPN
+ * was negotiated.  buf is always NUL-terminated if bufsz > 0.
+ */
+size_t tls_conn_get_alpn(const struct tls_conn *conn, char *buf, size_t bufsz);
+
+/*
+ * tls_conn_get_version -- return SSL_get_version() string for the
+ * negotiated TLS version, e.g. "TLSv1.3".
+ */
+const char *tls_conn_get_version(const struct tls_conn *conn);
 
 /*
  * tls_conn_close -- close the SSL connection and underlying TCP socket.

@@ -25,11 +25,55 @@
 #include <sys/types.h>
 #include <sys/socket.h>
 #include <netdb.h>
+#include <arpa/inet.h>
 #include <openssl/err.h>
 #include <openssl/objects.h>
+#include <openssl/x509.h>
+#include <openssl/x509v3.h>
+#include <openssl/pem.h>
 
 /* Maximum RPC reply body we will accept during STARTTLS (before TLS) */
 #define STARTTLS_REPLY_MAX 512
+
+/* --- keylog support (SSLKEYLOGFILE) --- */
+
+/*
+ * Keylog file shared across all SSL_CTX users.  OpenSSL's keylog callback
+ * has no user data parameter, so we stash the FILE * here.  Only one
+ * keylog destination is supported per process.
+ */
+static FILE *g_keylog_fp = NULL;
+
+static void keylog_callback(const SSL *ssl, const char *line)
+{
+    (void)ssl;
+    if (g_keylog_fp) {
+        fputs(line, g_keylog_fp);
+        fputc('\n', g_keylog_fp);
+        fflush(g_keylog_fp);
+    }
+}
+
+int tls_ctx_enable_keylog(SSL_CTX *ctx, const char *keylog_path)
+{
+    if (!ctx || !keylog_path)
+        return -1;
+
+    if (g_keylog_fp) {
+        /* Already configured -- just install the callback on this ctx */
+        SSL_CTX_set_keylog_callback(ctx, keylog_callback);
+        return 0;
+    }
+
+    g_keylog_fp = fopen(keylog_path, "ae");
+    if (!g_keylog_fp) {
+        fprintf(stderr, "tls_ctx_enable_keylog: fopen(%s, a): %s\n",
+                keylog_path, strerror(errno));
+        return -1;
+    }
+    SSL_CTX_set_keylog_callback(ctx, keylog_callback);
+    return 0;
+}
 
 /* --- timing helper --- */
 
@@ -521,4 +565,139 @@ void tls_conn_close(struct tls_conn *conn)
         close(conn->tc_fd);
         conn->tc_fd = -1;
     }
+}
+
+size_t tls_conn_get_alpn(const struct tls_conn *conn, char *buf, size_t bufsz)
+{
+    if (!conn || !conn->tc_ssl || !buf || bufsz == 0)
+        return 0;
+    const uint8_t *proto = NULL;
+    unsigned int   proto_len = 0;
+    SSL_get0_alpn_selected(conn->tc_ssl, &proto, &proto_len);
+    if (!proto || proto_len == 0) {
+        buf[0] = '\0';
+        return 0;
+    }
+    size_t copy = (proto_len < bufsz - 1) ? proto_len : bufsz - 1;
+    memcpy(buf, proto, copy);
+    buf[copy] = '\0';
+    return copy;
+}
+
+const char *tls_conn_get_version(const struct tls_conn *conn)
+{
+    if (!conn || !conn->tc_ssl)
+        return "(no connection)";
+    return SSL_get_version(conn->tc_ssl);
+}
+
+/*
+ * san_check_one -- look for one required entry in the SAN list.
+ *
+ * type_hint:  GEN_IPADD, GEN_DNS, or 0 to try both.
+ * value:      the literal value to match (IP string or DNS name)
+ *
+ * Returns 1 if found, 0 if not.
+ */
+static int san_check_one(STACK_OF(GENERAL_NAME) *sans, int type_hint,
+                         const char *value)
+{
+    int n = sk_GENERAL_NAME_num(sans);
+    for (int i = 0; i < n; i++) {
+        GENERAL_NAME *gn = sk_GENERAL_NAME_value(sans, i);
+        if (!gn)
+            continue;
+
+        if ((type_hint == 0 || type_hint == GEN_DNS) && gn->type == GEN_DNS) {
+            const char *dns = (const char *)
+                ASN1_STRING_get0_data(gn->d.dNSName);
+            int dns_len = ASN1_STRING_length(gn->d.dNSName);
+            if (dns_len > 0 && (size_t)dns_len == strlen(value) &&
+                strncasecmp(dns, value, (size_t)dns_len) == 0)
+                return 1;
+        }
+
+        if ((type_hint == 0 || type_hint == GEN_IPADD) &&
+            gn->type == GEN_IPADD) {
+            const unsigned char *ipdata = ASN1_STRING_get0_data(gn->d.iPAddress);
+            int iplen = ASN1_STRING_length(gn->d.iPAddress);
+            char ipstr[INET6_ADDRSTRLEN];
+            const char *p = NULL;
+            if (iplen == 4)
+                p = inet_ntop(AF_INET, ipdata, ipstr, sizeof(ipstr));
+            else if (iplen == 16)
+                p = inet_ntop(AF_INET6, ipdata, ipstr, sizeof(ipstr));
+            if (p && strcmp(p, value) == 0)
+                return 1;
+        }
+    }
+    return 0;
+}
+
+int tls_conn_check_san(const struct tls_conn *conn, const char *required,
+                       char *errbuf, size_t errsz)
+{
+    if (!conn || !conn->tc_ssl || !required) {
+        snprintf(errbuf, errsz, "tls_conn_check_san: bad argument");
+        return -1;
+    }
+
+    X509 *cert = SSL_get_peer_certificate(conn->tc_ssl);
+    if (!cert) {
+        snprintf(errbuf, errsz, "no peer certificate");
+        return -1;
+    }
+
+    STACK_OF(GENERAL_NAME) *sans = X509_get_ext_d2i(cert, NID_subject_alt_name,
+                                                    NULL, NULL);
+    if (!sans) {
+        snprintf(errbuf, errsz, "peer certificate has no subjectAltName");
+        X509_free(cert);
+        return -1;
+    }
+
+    /* Walk the comma-separated list */
+    char *copy = strdup(required);
+    if (!copy) {
+        snprintf(errbuf, errsz, "out of memory");
+        sk_GENERAL_NAME_pop_free(sans, GENERAL_NAME_free);
+        X509_free(cert);
+        return -1;
+    }
+
+    int rc = 0;
+    char *save = NULL;
+    for (char *tok = strtok_r(copy, ",", &save); tok;
+         tok = strtok_r(NULL, ",", &save)) {
+        /* Trim whitespace */
+        while (*tok == ' ' || *tok == '\t')
+            tok++;
+        char *end = tok + strlen(tok);
+        while (end > tok && (end[-1] == ' ' || end[-1] == '\t'))
+            *--end = '\0';
+        if (*tok == '\0')
+            continue;
+
+        int type_hint = 0;
+        const char *value = tok;
+        if (strncasecmp(tok, "IP:", 3) == 0) {
+            type_hint = GEN_IPADD;
+            value = tok + 3;
+        } else if (strncasecmp(tok, "DNS:", 4) == 0) {
+            type_hint = GEN_DNS;
+            value = tok + 4;
+        }
+
+        if (!san_check_one(sans, type_hint, value)) {
+            snprintf(errbuf, errsz,
+                     "SAN missing required entry: %s", tok);
+            rc = -1;
+            break;
+        }
+    }
+
+    free(copy);
+    sk_GENERAL_NAME_pop_free(sans, GENERAL_NAME_free);
+    X509_free(cert);
+    return rc;
 }
