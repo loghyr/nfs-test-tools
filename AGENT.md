@@ -12,6 +12,184 @@ This document explains what the script checks and why.
 
 ---
 
+## CLI Quick Reference
+
+### nfs_tls_test flags
+
+| Flag | Argument | Default | Purpose |
+|------|----------|---------|---------|
+| `--host` | HOST | (required) | NFS server hostname or IP |
+| `--port` | PORT | 2049 | TCP port |
+| `--iterations` | N | 10 | Connections per thread (or per duration) |
+| `--ca-cert` | FILE | — | CA certificate PEM; skip verify if absent |
+| `--cert` | FILE | — | Client certificate PEM (mutual TLS) |
+| `--key` | FILE | — | Client private key PEM (mutual TLS) |
+| `--no-null` | — | off | Skip post-handshake NULL RPC |
+| `--verbose` | — | off | Print per-connection details (single-thread only) |
+| `--threads` | N | 1 | Concurrent worker threads |
+| `--duration` | N | — | Run for N seconds (overrides `--iterations`) |
+| `--calls-per-conn` | N | 1 | NULL RPCs per TLS connection |
+| `--no-session-reuse` | — | off | Force full TLS handshake each time |
+| `--rate` | N | unlimited | Target connections/s |
+| `--progress` | N | 10 | Progress interval seconds (0 = off) |
+| `--tls-info` | — | off | Print negotiated TLS version/cipher/ALPN |
+| `--histogram` | — | off | Print ASCII latency histogram |
+| `--snapshot-stats` | — | off | Read `/proc/net/tls_stat` before/after |
+| `--output` | text\|json | text | Report format |
+| `--keylog` | FILE | — | NSS-format TLS key log for Wireshark |
+| `--check-san` | LIST | — | Require server cert SAN entries (comma-separated `IP:...,DNS:...`) |
+| `--require-tls13` | — | off | Treat TLS < 1.3 as failure |
+| `--require-alpn` | NAME | sunrpc | Require this ALPN protocol |
+| `--diagnose` | — | — | Run local pre-flight checks and exit |
+| `--print-error-table` | — | — | Print TLS error taxonomy and exit |
+
+### nfs_krb5_test flags
+
+| Flag | Argument | Default | Purpose |
+|------|----------|---------|---------|
+| `--host` | HOST | (required) | NFS server hostname or IP |
+| `--port` | PORT | 2049 | TCP port |
+| `--principal` | SPN | (required) | Service principal: `nfs/HOST@REALM` or `nfs@HOST` |
+| `--iterations` | N | 1 | GSS context + NULL call repetitions |
+| `--sec` | FLAVOR | krb5 | Security flavor: `krb5` (auth), `krb5i` (integrity), `krb5p` (privacy) |
+| `--probe-secinfo` | — | off | Two-step SECINFO probe (no TGT needed); exits before GSS setup |
+| `--threads` | N | — | Spawn N workers (1-256), each with its own GSS context |
+| `--stress` | — | off | Run all iterations past failures; emit per-code totals |
+| `--verbose` | — | off | Show GSS exchange details |
+| `--krb5-trace` | FILE | — | Set `KRB5_TRACE` for libkrb5 tracing (this process only) |
+| `--diagnose` | — | — | Run local pre-flight krb5 checks and exit |
+| `--print-error-table` | — | — | Print krb5 error taxonomy and exit |
+
+### Exit codes
+
+#### nfs_tls_test
+
+| Code | Phase | Meaning |
+|------|-------|---------|
+| 0 | — | All connections succeeded |
+| 10-15 | PRE_FLIGHT | `--diagnose` found a local config problem |
+| 20-22 | TCP | Connection refused, timeout, or DNS failure |
+| 30-32 | PROBE | AUTH_TLS probe rejected or malformed reply |
+| 40-50 | HANDSHAKE | TLS cert/cipher/ALPN/version error |
+| 60-61 | RPC | NULL RPC failed after TLS established |
+| 70-72 | KTLS | kTLS counter anomaly (decrypt error, rekey error, no-pad violation) |
+| 90 | — | MIXED: multiple distinct failure classes |
+| 99 | — | INTERNAL: tool/transport bug; file an issue |
+
+The exit code is the **lowest-numbered** phase that had failures,
+except when multiple phases fail: then 90 (MIXED).
+
+#### nfs_krb5_test
+
+| Code | Range | Phase | Meaning |
+|------|-------|-------|---------|
+| 0 | — | — | Success |
+| 100-109 | PRE_FLIGHT | — | Local environment: krb5.conf, keytab, gssd, FQDN |
+| 120-134 | KERBEROS | — | KDC / TGT / key version / enctype errors |
+| 150-159 | GSS | — | GSS-API layer errors (bad name, no cred, bad MIC) |
+| 170-179 | RPCSEC_GSS | — | Wire RPCSEC_GSS failures, WRONGSEC, replay |
+| 190-193 | IDMAP | — | Identity mapping failures |
+| 250 | — | MIXED | `--stress` run had more than one failure class |
+
+Use `--print-error-table` to see all codes and their fix suggestions.
+
+### [ERROR SYMBOL] block format
+
+Both tools write this block to stderr whenever a classified error occurs
+(always in `--stress` mode, at first failure in default mode):
+
+```
+[ERROR SYMBOL_NAME]  (context string)
+    One-line description of what went wrong.
+    Fix: what to do to resolve it.
+    See: TROUBLESHOOTING.md#section
+```
+
+The `SYMBOL_NAME` is a stable machine-readable token (e.g.,
+`KRB5_ERR_CLOCK_SKEW`, `TLS_ERR_CERT_EXPIRED`).  `analyze_nfs_results.py`
+parses these blocks to extract the verdict.
+
+In `--stress` mode, the context string shows the count:
+```
+[ERROR KRB5_ERR_RPCSEC_REPLAY]  (3 stress failures)
+    Server rejected seq_num as a replay.
+    Fix: server replay cache is too small or clock diverged mid-run.
+    See: TROUBLESHOOTING.md#rpcsec-replay
+```
+
+### --threads N output (nfs_krb5_test)
+
+Each worker reports its own result line after joining.  A summary
+follows:
+
+```
+thread 1: PASS (1 ok)
+thread 2: PASS (1 ok)
+thread 3: FAIL [ERROR KRB5_ERR_RPCSEC_REPLAY]
+thread 4: PASS (1 ok)
+
+threads: 4 total, 3 ok, 1 fail
+FAIL
+```
+
+The process exit code reflects the dominant failure class across all
+workers (or 250/MIXED if workers hit different error classes).
+
+### --probe-secinfo output (nfs_krb5_test)
+
+`--probe-secinfo` does not require a TGT.  It connects with AUTH_SYS
+and runs a two-step NFSv4 COMPOUND per RFC 5661 S18.45.5:
+
+```
+probe: step 1 AUTH_SYS NULL -> OK
+probe: step 2 PUTROOTFH + SECINFO_NO_NAME -> OK
+  flavors advertised: 6 (rpc_gss_svc_none) 390003 1 (sys)
+  --sec krb5 (6): PRESENT
+PASS
+```
+
+The exit code is 0 (PASS) if AUTH_SYS is accepted and the server
+responded.  A non-zero exit means the server refused AUTH_SYS on the
+root compound (NFS4ERR_WRONGSEC or connection failure) -- Kerberos
+negotiation cannot proceed.  Common exit codes in this path:
+`KRB5_ERR_WRONGSEC` (177) or `KRB5_ERR_SECINFO_EMPTY` (178).
+
+### analyze_nfs_results.py
+
+Parses captured stdout+stderr from either tool and exits
+0 (PASS), 1 (FAIL), or 2 (WARN).
+
+```bash
+# Pipe directly
+./src/nfs_tls_test --host SERVER --threads 4 --iterations 1000 \
+    --tls-info 2>&1 | scripts/analyze_nfs_results.py
+
+# From a saved file
+scripts/analyze_nfs_results.py results.txt
+
+# Loosen latency thresholds for a cross-datacenter run
+scripts/analyze_nfs_results.py \
+    --warn-handshake-p99 150 \
+    --fail-handshake-p99 800 \
+    --warn-total-p99 400 \
+    --fail-total-p99 2000 \
+    results.txt
+```
+
+Available threshold flags (all in ms unless noted):
+
+| Flag | Default | Meaning |
+|------|---------|---------|
+| `--warn-tcp-p99` | 10 | WARN if tcp p99 exceeds this |
+| `--fail-tcp-p99` | 50 | FAIL if tcp p99 exceeds this |
+| `--warn-handshake-p99` | 100 | WARN if handshake p99 exceeds this |
+| `--fail-handshake-p99` | 500 | FAIL if handshake p99 exceeds this |
+| `--warn-total-p99` | 200 | WARN if total p99 exceeds this |
+| `--fail-total-p99` | 1000 | FAIL if total p99 exceeds this |
+| `--warn-session-reuse` | 50 | WARN if session reuse rate below this % |
+
+---
+
 ## nfs_tls_test
 
 ### What it tests

@@ -476,7 +476,7 @@ calls -- mount-time failures live in `rpc.gssd` / `gssproxy` and
 need `rpcdebug -m rpc -s auth` plus `journalctl -u rpc-gssd -f`
 instead.
 
-#### Stress mode (replay-cache thrash)
+#### Stress mode (replay-cache thrash, single context)
 
 ```bash
 ./nfs_krb5_test --host SERVER --sec krb5p \
@@ -488,6 +488,52 @@ intermittent failures, churning seq_num against the server's
 RPCSEC_GSS replay window.  Reports per-symbolic-code totals at
 the end and exits with the dominant code (or `250` MIXED if more
 than one class fails).
+
+#### Multi-worker stress mode (concurrent contexts)
+
+```bash
+./nfs_krb5_test --host SERVER --threads 8 \
+  --iterations 100 --sec krb5i
+```
+
+Spawns N worker threads (1..256); each establishes its own independent
+RPCSEC_GSS context and runs `--iterations` NULL calls concurrently.
+Exercises the server's per-context replay cache under load from N
+simultaneous GSS handles rather than one churned seq_num.  Aggregate
+results (ok count, per-symbol-code failure counts) are reported after
+all workers join, using the same taxonomy as `--stress`.
+
+Combine with `--stress` to run all iterations past failures within
+each worker:
+
+```bash
+./nfs_krb5_test --host SERVER --threads 8 \
+  --iterations 1000 --stress --sec krb5p
+```
+
+#### SECINFO probe (pre-Kerberos connectivity check)
+
+```bash
+./nfs_krb5_test --host SERVER --probe-secinfo
+```
+
+Sends a two-step NFSv4 COMPOUND using `AUTH_SYS` (no Kerberos or TGT
+required):
+
+1. **Step 1** -- bare NULL COMPOUND to check whether the server accepts
+   `AUTH_SYS` at all.  If it returns `NFS4ERR_WRONGSEC`, the server
+   refuses `AUTH_SYS` even for this probe, which is an RFC 5661
+   §18.45.5 violation (the spec requires PUTROOTFH + SECINFO_NO_NAME
+   to succeed with `AUTH_SYS`).
+
+2. **Step 2** -- `PUTROOTFH + SECINFO_NO_NAME` to list the security
+   flavors the server advertises for the root export.  Reports which
+   flavors are present and whether the `--sec` target flavor is among
+   them.
+
+Exits after the probe without attempting Kerberos context setup.
+Useful for diagnosing `NFS4ERR_WRONGSEC` before you have a valid TGT,
+or to confirm a server's security policy before `kinit`.
 
 #### Symbolic exit codes
 
