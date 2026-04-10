@@ -1108,6 +1108,14 @@ int main(int argc, char **argv)
      * The file is appended to, not truncated, so multiple runs
      * accumulate.  Do not delete the file mid-run; libkrb5 keeps an
      * fd open against it for the life of the process.
+     *
+     * Edge case: if a GSS mechanism plugin linked into this binary calls
+     * krb5_init_context from a library constructor (__attribute__
+     * ((constructor))), KRB5_TRACE is checked before main() runs and
+     * setenv here will be too late for those early calls.  Stock MIT
+     * krb5 and the standard gssapi_krb5 plugin do not do this; exotic
+     * third-party mech libraries might.  If you need to capture those
+     * early calls, set KRB5_TRACE in the shell before invoking the tool.
      */
     if (opts.o_krb5_trace) {
         if (setenv("KRB5_TRACE", opts.o_krb5_trace, 1) != 0) {
