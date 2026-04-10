@@ -29,7 +29,13 @@ int nfs_error_register(const struct nfs_error_table *table)
     if (!table)
         return -1;
 
-    /* Idempotent: same pointer twice is a no-op. */
+    /*
+     * Idempotent: same pointer twice is a no-op.  Dedup is by pointer
+     * identity, not by domain string, because two distinct tables in
+     * the same domain (e.g. a test harness mock) must both register.
+     * Overflowing NFS_ERROR_MAX_TABLES is a programmer error; callers
+     * that hit the -1 return should raise the constant in this file.
+     */
     for (size_t i = 0; i < s_n_tables; i++) {
         if (s_tables[i] == table)
             return 0;
