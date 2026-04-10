@@ -1265,19 +1265,21 @@ int main(int argc, char **argv)
      *
      *   --stress: keep iterating regardless of failures.  Track
      *   per-code counts in stress_fail_by_code[] (krb5 codes 100..199
-     *   indexed offset-100; everything else accumulates in
-     *   stress_fail_internal).  After the loop, emit one [ERROR
-     *   SYMBOL] block per non-zero code and compute the canonical
-     *   exit code: NFS_ERR_OK if no failures, the single dominant
-     *   krb5 code if exactly one class failed, NFS_ERR_MIXED if more
-     *   than one.  Useful for catching intermittent server-side bugs
-     *   and replay-cache thrash where seq_num churn under load
-     *   surfaces RPCSEC_REPLAY or RPCSEC_CTXPROBLEM after some N
-     *   successful calls.
+     *   indexed offset-100), transport / tool bugs in
+     *   stress_fail_internal (NFS_ERR_INTERNAL = 255), and anything
+     *   that doesn't fit either bucket in stress_fail_unclassified.
+     *   After the loop, emit one [ERROR SYMBOL] block per non-zero code
+     *   and compute the canonical exit code: NFS_ERR_OK if no failures,
+     *   the single dominant krb5 code if exactly one class failed,
+     *   NFS_ERR_MIXED if more than one.  Useful for catching
+     *   intermittent server-side bugs and replay-cache thrash where
+     *   seq_num churn under load surfaces RPCSEC_REPLAY or
+     *   RPCSEC_CTXPROBLEM after some N successful calls.
      */
     int result_code = NFS_ERR_OK;
     long stress_ok = 0;
     long stress_fail_internal = 0;
+    long stress_fail_unclassified = 0;       /* codes outside known ranges */
     long stress_fail_by_code[100] = { 0 };  /* index = code - 100 */
 
     for (long i = 0; i < opts.o_iterations; i++) {
@@ -1323,8 +1325,16 @@ int main(int argc, char **argv)
 record:
         if (iter_code >= 100 && iter_code < 200)
             stress_fail_by_code[iter_code - 100]++;
-        else
+        else if (iter_code == NFS_ERR_INTERNAL)
             stress_fail_internal++;
+        else
+            /*
+             * Code outside {0, 100..199, NFS_ERR_INTERNAL}.  Should
+             * not happen today; tracked separately so future additions
+             * that forget to update this switch are visible rather than
+             * silently inflating stress_fail_internal.
+             */
+            stress_fail_unclassified++;
 
         if (!opts.o_stress) {
             /* Default mode: emit immediately and bail. */
@@ -1370,6 +1380,15 @@ record:
                      stress_fail_internal,
                      stress_fail_internal == 1 ? "" : "s");
             nfs_error_emit_one(stderr, NFS_ERR_INTERNAL, ctx);
+            distinct++;
+            single_code = NFS_ERR_INTERNAL;
+        }
+        if (stress_fail_unclassified > 0) {
+            fprintf(stderr,
+                    "[ERROR ?]  (%ld unclassified failure%s -- "
+                    "unknown exit code; please file a bug)\n",
+                    stress_fail_unclassified,
+                    stress_fail_unclassified == 1 ? "" : "s");
             distinct++;
             single_code = NFS_ERR_INTERNAL;
         }
