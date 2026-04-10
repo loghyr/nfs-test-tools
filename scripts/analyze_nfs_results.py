@@ -79,6 +79,24 @@ class Finding:
     message: str
 
 
+@dataclass
+class SymbolBlock:
+    """One [ERROR SYMBOL] block emitted by either nfs_tls_test or
+    nfs_krb5_test via nfs_error_emit_one().
+
+    The block has a stable shape:
+        [ERROR SYMBOL]  (context)
+            description
+            Fix: suggestion
+            See: TROUBLESHOOTING.md#anchor
+    """
+    symbol: str       # e.g. "CLOCK_SKEW", "CERT_EXPIRED"
+    context: str      # the (...) text, or "" if absent
+    description: str  # first indented line
+    fix: str          # text after "Fix: "
+    anchor: str       # text after "See: TROUBLESHOOTING.md#"
+
+
 # ---------------------------------------------------------------------------
 # Parsers
 # ---------------------------------------------------------------------------
@@ -161,6 +179,65 @@ def parse_tls(lines: list) -> Optional[TlsResult]:
             r.samples_dropped = True
 
     return r
+
+
+def parse_symbol_blocks(lines: list) -> list:
+    """Extract every [ERROR SYMBOL] block from the tool output.
+
+    Both nfs_tls_test and nfs_krb5_test emit these blocks via the
+    shared nfs_error_emit_one() function in src/nfs_error.c, so a
+    single regex-driven walker handles either tool's output without
+    knowing which domain produced the block.
+
+    Returns a list of SymbolBlock entries in the order they were
+    emitted.  An empty list is returned if no blocks are present
+    (e.g. PASS runs, or older tool versions before the taxonomy
+    work).
+    """
+    blocks = []
+    i = 0
+    n = len(lines)
+    header_re = re.compile(r'^\[ERROR\s+(\S+)\](?:\s+\((.*)\))?\s*$')
+    while i < n:
+        m = header_re.match(lines[i])
+        if not m:
+            i += 1
+            continue
+        symbol  = m.group(1)
+        context = m.group(2) or ""
+        # The next three lines are conventionally:
+        #     <description>
+        #     Fix: <suggestion>
+        #     See: TROUBLESHOOTING.md#<anchor>
+        # but we tolerate missing trailing lines.
+        description = ""
+        fix         = ""
+        anchor      = ""
+        if i + 1 < n and lines[i + 1].startswith('    ') \
+                and not lines[i + 1].lstrip().startswith(('Fix:', 'See:')):
+            description = lines[i + 1].strip()
+        for j in (i + 2, i + 3, i + 4):
+            if j >= n:
+                break
+            l = lines[j].strip()
+            if l.startswith('Fix:'):
+                fix = l[4:].strip()
+            elif l.startswith('See:'):
+                see = l[4:].strip()
+                # "TROUBLESHOOTING.md#anchor"
+                if '#' in see:
+                    anchor = see.split('#', 1)[1]
+            elif not l:
+                break
+        blocks.append(SymbolBlock(
+            symbol=symbol,
+            context=context,
+            description=description,
+            fix=fix,
+            anchor=anchor,
+        ))
+        i += 1
+    return blocks
 
 
 def parse_tls_json(text: str) -> Optional[TlsResult]:
@@ -296,8 +373,34 @@ class Thresholds:
 # Analysis
 # ---------------------------------------------------------------------------
 
-def analyze_tls(r: TlsResult, th: Thresholds) -> list:
+def add_symbol_findings(findings: list, blocks: list, domain: str) -> None:
+    """Append one FAIL Finding per [ERROR SYMBOL] block.
+
+    The check name is "<domain>_<symbol_lower>" so multiple findings
+    from the same run are individually addressable in CI matchers.
+    The message includes the description and the doc anchor pointer
+    so users can navigate to the matching TROUBLESHOOTING.md section
+    without re-reading the raw tool output.
+    """
+    for b in blocks:
+        check = f"{domain}_{b.symbol.lower()}"
+        bits = []
+        if b.context:
+            bits.append(f"({b.context})")
+        if b.description:
+            bits.append(b.description)
+        if b.fix:
+            bits.append(f"Fix: {b.fix}")
+        if b.anchor:
+            bits.append(f"see TROUBLESHOOTING.md#{b.anchor}")
+        findings.append(Finding('FAIL', check, " — ".join(bits)))
+
+
+def analyze_tls(r: TlsResult, th: Thresholds, blocks=None) -> list:
     findings = []
+
+    if blocks:
+        add_symbol_findings(findings, blocks, "tls")
 
     def add(level, check, msg):
         findings.append(Finding(level, check, msg))
@@ -397,20 +500,38 @@ def analyze_tls(r: TlsResult, th: Thresholds) -> list:
     return findings
 
 
-def analyze_krb5(r: Krb5Result) -> list:
+def analyze_krb5(r: Krb5Result, blocks=None) -> list:
     findings = []
 
     def add(level, check, msg):
         findings.append(Finding(level, check, msg))
 
+    # PASS path: always trustworthy regardless of whether the tool
+    # emitted symbol blocks (it won't, on success).
     if r.verdict == 'PASS':
-        add('PASS', 'verdict', 'RPCSEC_GSS context established and all NULL calls succeeded')
+        add('PASS', 'verdict',
+            'RPCSEC_GSS context established and all NULL calls succeeded')
         if r.null_calls_total > 0:
             add('PASS', 'null_calls',
-                f"{r.null_calls_ok}/{r.null_calls_total} authenticated NULL call(s) OK")
+                f"{r.null_calls_ok}/{r.null_calls_total} authenticated NULL "
+                f"call(s) OK")
         return findings
 
-    # FAIL path
+    # FAIL path: prefer the symbolic blocks if the tool emitted any.
+    # They carry the precise failure class plus a doc anchor and
+    # superseed the older step_causes heuristic, which existed only
+    # because nfs_krb5_test used to print free-form fprintf lines.
+    if blocks:
+        add_symbol_findings(findings, blocks, "krb5")
+        if not r.context_established:
+            add('FAIL', 'context',
+                'RPCSEC_GSS context was never established')
+        return findings
+
+    # No symbolic blocks: fall back to the historical step heuristic.
+    # This branch only runs against output from older nfs_krb5_test
+    # builds (pre-taxonomy commit) and can be removed once nothing
+    # in CI runs the legacy binary.
     step_causes = {
         'tcp_connect':         'Server not reachable: wrong host/port, firewall, or server down',
         'gss_import_name':     'Invalid --principal syntax; use "nfs/hostname@REALM" or "nfs@hostname"',
@@ -536,6 +657,12 @@ def main():
     # detect it by the leading '{'.
     tls_result_json = parse_tls_json(text)
 
+    # Extract domain-agnostic [ERROR SYMBOL] blocks once.  Both
+    # nfs_tls_test (since the taxonomy commit) and nfs_krb5_test (since
+    # the krb5 wiring commit) emit these via nfs_error_emit_one() in a
+    # stable shape, so a single regex walker handles either tool.
+    symbol_blocks = parse_symbol_blocks(lines) if not tls_result_json else []
+
     th = Thresholds(
         warn_tcp_p99_ms=args.warn_tcp_p99,
         fail_tcp_p99_ms=args.fail_tcp_p99,
@@ -554,12 +681,12 @@ def main():
     verdicts = []
 
     if tls_result:
-        findings = analyze_tls(tls_result, th)
+        findings = analyze_tls(tls_result, th, blocks=symbol_blocks)
         v = print_report('nfs_tls_test', tls_result.header, findings)
         verdicts.append(v)
 
     if krb5_result:
-        findings = analyze_krb5(krb5_result)
+        findings = analyze_krb5(krb5_result, blocks=symbol_blocks)
         v = print_report('nfs_krb5_test', krb5_result.header, findings)
         verdicts.append(v)
 
