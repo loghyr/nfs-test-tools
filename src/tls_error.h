@@ -21,6 +21,7 @@
 #define TLS_ERROR_H
 
 #include <stddef.h>
+#include <stdio.h>
 
 enum tls_phase {
     TLS_PHASE_PRE_FLIGHT = 0,  /* local environment check */
@@ -97,6 +98,10 @@ struct tls_error_info {
     const char         *symbol;       /* e.g. "CERT_EXPIRED" */
     const char         *description;  /* one-line human-readable */
     const char         *suggestion;   /* one-line fix hint */
+    const char         *doc_anchor;   /* TROUBLESHOOTING.md anchor,
+                                       * e.g. "cert_expired", or NULL
+                                       * to fall back to the phase
+                                       * section anchor */
 };
 
 /*
@@ -118,5 +123,37 @@ const char *tls_error_phase_name(enum tls_phase phase);
  * `nfs_tls_test --print-error-table`.
  */
 void tls_error_print_table(void);
+
+/*
+ * tls_error_emit_one -- pretty-print a single error to f, including
+ * the symbolic name, description, suggested fix, and a pointer to
+ * the matching section in TROUBLESHOOTING.md.
+ *
+ * If context != NULL it is appended in parentheses after the symbol
+ * (e.g. "(42 failures across 4 workers)").
+ *
+ * Format:
+ *   [ERROR CERT_EXPIRED]  (42 failures)
+ *       Server certificate has expired
+ *       Fix: Renew the server certificate
+ *       See: TROUBLESHOOTING.md#cert_expired
+ */
+void tls_error_emit_one(FILE *f, enum tls_error_code code,
+                        const char *context);
+
+/*
+ * tls_error_default_for_phase -- return the canonical "summary" error
+ * code for a phase.  Used by nfs_tls_test when only a per-phase failure
+ * count is available and a single representative code must be chosen.
+ *
+ *   PRE_FLIGHT -> TLS_ERR_KERNEL_TOO_OLD
+ *   TCP        -> TLS_ERR_TCP_REFUSED
+ *   PROBE      -> TLS_ERR_PROBE_REJECTED
+ *   HANDSHAKE  -> TLS_ERR_HANDSHAKE_FAILED
+ *   RPC        -> TLS_ERR_RPC_FAILED
+ *
+ * Returns TLS_ERR_INTERNAL for an unknown phase.
+ */
+enum tls_error_code tls_error_default_for_phase(enum tls_phase phase);
 
 #endif /* TLS_ERROR_H */

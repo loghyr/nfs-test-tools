@@ -683,6 +683,40 @@ static void print_report(const struct options *o,
     printf("\nError breakdown: %ld tcp, %ld probe, %ld handshake, %ld rpc\n",
            fail_tcp, fail_probe, fail_hs, fail_rpc);
 
+    /*
+     * For each phase that had failures, print one canonical error
+     * descriptor with a pointer to the matching TROUBLESHOOTING.md
+     * section.  Testers can copy the symbolic name into bug reports
+     * and CI matchers without parsing the prose.
+     */
+    const struct {
+        long             count;
+        enum tls_phase   phase;
+    } phase_summary[] = {
+        { fail_tcp,    TLS_PHASE_TCP       },
+        { fail_probe,  TLS_PHASE_PROBE     },
+        { fail_hs,     TLS_PHASE_HANDSHAKE },
+        { fail_rpc,    TLS_PHASE_RPC       },
+    };
+    int any_phase_failed = 0;
+    for (size_t i = 0; i < sizeof(phase_summary)/sizeof(phase_summary[0]); i++) {
+        if (phase_summary[i].count <= 0)
+            continue;
+        if (!any_phase_failed) {
+            printf("\nMost likely causes (see TROUBLESHOOTING.md for details):\n");
+            any_phase_failed = 1;
+        }
+        char ctx[64];
+        snprintf(ctx, sizeof(ctx),
+                 "%ld %s failure%s",
+                 phase_summary[i].count,
+                 tls_error_phase_name(phase_summary[i].phase),
+                 phase_summary[i].count == 1 ? "" : "s");
+        tls_error_emit_one(stdout,
+                           tls_error_default_for_phase(phase_summary[i].phase),
+                           ctx);
+    }
+
     free(ms_total); free(ms_tcp); free(ms_probe); free(ms_hs); free(ms_rpc);
 }
 
@@ -986,18 +1020,64 @@ int main(int argc, char **argv)
     if (o.o_snapshot_stats && !o.o_json)
         ktls_errors = tls_stat_diff_print(&ts_before, &ts_after);
 
-    /* Non-zero exit if any failures -- read before freeing workers */
-    long total_fail = 0;
+    /*
+     * Compute canonical exit status from per-phase failure counts.
+     *
+     * Reason: shell users / CI can match on the symbolic exit code to
+     * decide what failed.  TLS_ERR_OK on success, the phase's default
+     * code if exactly one phase failed, TLS_ERR_MIXED if more than one
+     * class failed in the same run.
+     *
+     * This replaces the historical EXIT_FAILURE-on-any-failure
+     * behaviour.  Codes live in the 10..99 range so they don't collide
+     * with the standard 0/1/2 shell convention badly, and are stable
+     * across releases per the tls_error.h taxonomy.
+     */
+    long fail_tcp_total = 0, fail_probe_total = 0;
+    long fail_hs_total  = 0, fail_rpc_total   = 0;
     for (int i = 0; i < nworkers; i++) {
-        total_fail += atomic_load_explicit(&workers[i].w_fail_tcp,
-                                           memory_order_relaxed)
-                   +  atomic_load_explicit(&workers[i].w_fail_probe,
-                                           memory_order_relaxed)
-                   +  atomic_load_explicit(&workers[i].w_fail_handshake,
-                                           memory_order_relaxed)
-                   +  atomic_load_explicit(&workers[i].w_fail_rpc,
-                                           memory_order_relaxed);
+        fail_tcp_total   += atomic_load_explicit(&workers[i].w_fail_tcp,
+                                                 memory_order_relaxed);
+        fail_probe_total += atomic_load_explicit(&workers[i].w_fail_probe,
+                                                 memory_order_relaxed);
+        fail_hs_total    += atomic_load_explicit(&workers[i].w_fail_handshake,
+                                                 memory_order_relaxed);
+        fail_rpc_total   += atomic_load_explicit(&workers[i].w_fail_rpc,
+                                                 memory_order_relaxed);
     }
+    long total_fail = fail_tcp_total + fail_probe_total
+                    + fail_hs_total  + fail_rpc_total;
+
+    int distinct_classes = 0;
+    enum tls_error_code single_code = TLS_ERR_OK;
+    if (fail_tcp_total > 0) {
+        distinct_classes++;
+        single_code = TLS_ERR_TCP_REFUSED;
+    }
+    if (fail_probe_total > 0) {
+        distinct_classes++;
+        single_code = TLS_ERR_PROBE_REJECTED;
+    }
+    if (fail_hs_total > 0) {
+        distinct_classes++;
+        single_code = TLS_ERR_HANDSHAKE_FAILED;
+    }
+    if (fail_rpc_total > 0) {
+        distinct_classes++;
+        single_code = TLS_ERR_RPC_FAILED;
+    }
+    if (ktls_errors > 0) {
+        distinct_classes++;
+        single_code = TLS_ERR_KTLS_DECRYPT_ERROR;
+    }
+
+    enum tls_error_code exit_code;
+    if (total_fail == 0 && ktls_errors == 0)
+        exit_code = TLS_ERR_OK;
+    else if (distinct_classes == 1)
+        exit_code = single_code;
+    else
+        exit_code = TLS_ERR_MIXED;
 
     /* Cleanup */
     for (int i = 0; i < nworkers; i++) {
@@ -1007,6 +1087,5 @@ int main(int argc, char **argv)
     free(workers);
     SSL_CTX_free(ctx);
 
-    return (total_fail == 0 && ktls_errors == 0)
-           ? EXIT_SUCCESS : EXIT_FAILURE;
+    return (int)exit_code;
 }
