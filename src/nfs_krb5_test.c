@@ -694,6 +694,19 @@ static int parse_data_reply_verifier(const uint8_t *body, size_t body_len,
             return -1;
         }
 
+        /* RFC 2203 S5.3.2: after the checksum there must be no further
+         * data.  A noncompliant server appending trailing bytes would
+         * otherwise pass silently. */
+        uint32_t mic_padded = (mic_len + 3u) & ~3u;
+        size_t expected_end = pos + mic_padded;
+        if (expected_end != body_len) {
+            snprintf(errbuf, errsz,
+                     "krb5i reply: %zu trailing byte%s after checksum",
+                     body_len - pos,
+                     (body_len - pos) == 1 ? "" : "s");
+            return -1;
+        }
+
         /* Verify the inner seq_num matches. */
         if (inner_len < 4) {
             snprintf(errbuf, errsz,
