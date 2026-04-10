@@ -27,29 +27,15 @@
 #include <openssl/pem.h>
 #include <openssl/err.h>
 
-enum verdict { V_PASS = 0, V_WARN = 2, V_FAIL = 1 };
-
-static enum verdict combine(enum verdict a, enum verdict b)
-{
-    if (a == V_FAIL || b == V_FAIL) return V_FAIL;
-    if (a == V_WARN || b == V_WARN) return V_WARN;
-    return V_PASS;
-}
-
-static const char *verdict_str(enum verdict v)
-{
-    switch (v) {
-    case V_PASS: return "PASS";
-    case V_WARN: return "WARN";
-    case V_FAIL: return "FAIL";
-    }
-    return "?";
-}
-
-static void emit(const char *check, enum verdict v, const char *detail)
-{
-    printf("DIAG: %s: %s: %s\n", check, verdict_str(v), detail);
-}
+/*
+ * Local convenience aliases so the existing check function bodies
+ * (and report_* helpers below) keep their old, terse spelling.
+ * The public diag_emit / diag_combine / diag_verdict_str symbols
+ * live in the registry section below.
+ */
+#define emit         diag_emit
+#define combine      diag_combine
+#define verdict_str  diag_verdict_str
 
 /*
  * file_exists -- stat() and report whether a path exists and is a regular
@@ -70,20 +56,20 @@ static bool file_exists(const char *path)
  * for any NFS-over-TLS support); recommend >= 6.12 (where major fixes
  * landed).  Non-Linux returns WARN.
  */
-static enum verdict check_kernel_version(void)
+static enum diag_verdict check_kernel_version(void)
 {
     struct utsname un;
     if (uname(&un) != 0) {
-        emit("kernel-version", V_WARN, "uname() failed");
-        return V_WARN;
+        emit("kernel-version", DIAG_WARN, "uname() failed");
+        return DIAG_WARN;
     }
 
     if (strcmp(un.sysname, "Linux") != 0) {
         char buf[128];
         snprintf(buf, sizeof(buf), "non-Linux (%s); see FreeBSD docs",
                  un.sysname);
-        emit("kernel-version", V_WARN, buf);
-        return V_WARN;
+        emit("kernel-version", DIAG_WARN, buf);
+        return DIAG_WARN;
     }
 
     int major = 0, minor = 0;
@@ -91,8 +77,8 @@ static enum verdict check_kernel_version(void)
         char buf[128];
         snprintf(buf, sizeof(buf), "unparseable release string: %s",
                  un.release);
-        emit("kernel-version", V_WARN, buf);
-        return V_WARN;
+        emit("kernel-version", DIAG_WARN, buf);
+        return DIAG_WARN;
     }
 
     char detail[128];
@@ -100,20 +86,20 @@ static enum verdict check_kernel_version(void)
              major, minor, un.release);
 
     if (major < 6 || (major == 6 && minor < 5)) {
-        emit("kernel-version", V_FAIL, detail);
-        return V_FAIL;
+        emit("kernel-version", DIAG_FAIL, detail);
+        return DIAG_FAIL;
     }
     if (major == 6 && minor < 12) {
         char warn[200];
         snprintf(warn, sizeof(warn),
                  "%s -- 6.12+ recommended for stable client behaviour",
                  detail);
-        emit("kernel-version", V_WARN, warn);
-        return V_WARN;
+        emit("kernel-version", DIAG_WARN, warn);
+        return DIAG_WARN;
     }
 
-    emit("kernel-version", V_PASS, detail);
-    return V_PASS;
+    emit("kernel-version", DIAG_PASS, detail);
+    return DIAG_PASS;
 }
 
 /*
@@ -121,11 +107,11 @@ static enum verdict check_kernel_version(void)
  * if available; many distros don't ship the kernel config, in which case
  * we have to skip the check.
  */
-static enum verdict check_sunrpc_tls(void)
+static enum diag_verdict check_sunrpc_tls(void)
 {
     struct utsname un;
     if (uname(&un) != 0)
-        return V_WARN;
+        return DIAG_WARN;
 
     char path[256];
     snprintf(path, sizeof(path), "/boot/config-%s", un.release);
@@ -134,20 +120,20 @@ static enum verdict check_sunrpc_tls(void)
     if (!fp) {
         char buf[300];
         snprintf(buf, sizeof(buf), "no kernel config at %s (skipping)", path);
-        emit("kernel-config", V_WARN, buf);
-        return V_PASS;  /* don't penalise systems that don't ship the config */
+        emit("kernel-config", DIAG_WARN, buf);
+        return DIAG_PASS;  /* don't penalise systems that don't ship the config */
     }
 
-    enum verdict v = V_FAIL;
+    enum diag_verdict v = DIAG_FAIL;
     const char *detail = "CONFIG_SUNRPC_TLS not found";
     char line[512];
     while (fgets(line, sizeof(line), fp)) {
         if (strncmp(line, "CONFIG_SUNRPC_TLS=", 18) == 0) {
             if (line[18] == 'y' || line[18] == 'Y') {
-                v = V_PASS;
+                v = DIAG_PASS;
                 detail = "CONFIG_SUNRPC_TLS=y";
             } else if (line[18] == 'm') {
-                v = V_PASS;
+                v = DIAG_PASS;
                 detail = "CONFIG_SUNRPC_TLS=m (module)";
             }
             break;
@@ -162,20 +148,20 @@ static enum verdict check_sunrpc_tls(void)
 /*
  * tls module loaded.  Read /proc/modules; if absent, skip.
  */
-static enum verdict check_tls_module(void)
+static enum diag_verdict check_tls_module(void)
 {
     FILE *fp = fopen("/proc/modules", "re");
     if (!fp) {
-        emit("tls-module", V_WARN, "/proc/modules unavailable");
-        return V_PASS;
+        emit("tls-module", DIAG_WARN, "/proc/modules unavailable");
+        return DIAG_PASS;
     }
 
-    enum verdict v = V_WARN;
+    enum diag_verdict v = DIAG_WARN;
     const char *detail = "tls module not in /proc/modules (may be built in)";
     char line[256];
     while (fgets(line, sizeof(line), fp)) {
         if (strncmp(line, "tls ", 4) == 0) {
-            v = V_PASS;
+            v = DIAG_PASS;
             detail = "tls module loaded";
             break;
         }
@@ -183,7 +169,7 @@ static enum verdict check_tls_module(void)
     fclose(fp);
 
     emit("tls-module", v, detail);
-    return v == V_WARN ? V_PASS : v;  /* WARN here is acceptable */
+    return v == DIAG_WARN ? DIAG_PASS : v;  /* WARN here is acceptable */
 }
 
 /*
@@ -193,7 +179,7 @@ static enum verdict check_tls_module(void)
  *           portable C program, but we can spot the typical install paths
  *           and check whether the daemon is alive via /proc.
  */
-static enum verdict check_tlshd(void)
+static enum diag_verdict check_tlshd(void)
 {
     /* Common install locations */
     static const char *paths[] = {
@@ -214,11 +200,11 @@ static enum verdict check_tlshd(void)
     }
 
     if (!found) {
-        emit("tlshd-installed", V_FAIL,
+        emit("tlshd-installed", DIAG_FAIL,
              "tlshd not found (install ktls-utils)");
-        return V_FAIL;
+        return DIAG_FAIL;
     }
-    emit("tlshd-installed", V_PASS, found_path);
+    emit("tlshd-installed", DIAG_PASS, found_path);
 
     /*
      * Check whether tlshd is running.  We shell out to pgrep rather
@@ -235,24 +221,24 @@ static enum verdict check_tlshd(void)
      */
     int rc = system("pgrep -x tlshd >/dev/null 2>&1");
     if (rc == -1) {
-        emit("tlshd-running", V_WARN, "system() failed");
-        return V_WARN;
+        emit("tlshd-running", DIAG_WARN, "system() failed");
+        return DIAG_WARN;
     }
     if (WIFEXITED(rc)) {
         int code = WEXITSTATUS(rc);
         if (code == 0) {
-            emit("tlshd-running", V_PASS, "tlshd process found");
-            return V_PASS;
+            emit("tlshd-running", DIAG_PASS, "tlshd process found");
+            return DIAG_PASS;
         }
         if (code == 127) {
-            emit("tlshd-running", V_WARN,
+            emit("tlshd-running", DIAG_WARN,
                  "cannot check (pgrep not installed)");
-            return V_WARN;
+            return DIAG_WARN;
         }
     }
-    emit("tlshd-running", V_WARN,
+    emit("tlshd-running", DIAG_WARN,
          "tlshd not running (systemctl start tlshd)");
-    return V_WARN;
+    return DIAG_WARN;
 }
 
 /*
@@ -260,7 +246,7 @@ static enum verdict check_tlshd(void)
  * since 1.1.1, so this is mostly a sanity check that we linked against
  * a real OpenSSL.
  */
-static enum verdict check_openssl(void)
+static enum diag_verdict check_openssl(void)
 {
     long ver = OPENSSL_VERSION_NUMBER;
     char buf[128];
@@ -268,32 +254,162 @@ static enum verdict check_openssl(void)
              OpenSSL_version(OPENSSL_VERSION), ver);
 
     if (ver < 0x10101000L) {
-        emit("openssl-version", V_FAIL, buf);
-        return V_FAIL;
+        emit("openssl-version", DIAG_FAIL, buf);
+        return DIAG_FAIL;
     }
-    emit("openssl-version", V_PASS, buf);
-    return V_PASS;
+    emit("openssl-version", DIAG_PASS, buf);
+    return DIAG_PASS;
 }
 
-/* --- public API --- */
+/* --- public API: shared verdict primitives ----------------------- */
+/*
+ * The shadowing #define macros at the top of this file expand
+ * `emit`, `combine`, `verdict_str` (used in the check function bodies
+ * above and in cert_info_run below) into the diag_* symbols defined
+ * here.  The macros are intentionally not #undef'd so the existing
+ * call sites stay terse; per-domain check sources in other files can
+ * call the diag_* spelling directly.
+ */
+
+void diag_emit(const char *check, enum diag_verdict v, const char *detail)
+{
+    printf("DIAG: %s: %s: %s\n", check, diag_verdict_str(v), detail);
+}
+
+enum diag_verdict diag_combine(enum diag_verdict a, enum diag_verdict b)
+{
+    if (a == DIAG_FAIL || b == DIAG_FAIL) return DIAG_FAIL;
+    if (a == DIAG_WARN || b == DIAG_WARN) return DIAG_WARN;
+    return DIAG_PASS;
+}
+
+const char *diag_verdict_str(enum diag_verdict v)
+{
+    switch (v) {
+    case DIAG_PASS: return "PASS";
+    case DIAG_WARN: return "WARN";
+    case DIAG_FAIL: return "FAIL";
+    }
+    return "?";
+}
+
+/* --- public API: registry --------------------------------------- */
+
+/*
+ * Maximum number of registered checks.  Sized to comfortably hold
+ * the TLS + krb5 check sets without dynamic allocation.
+ */
+#define DIAG_MAX_CHECKS  32
+
+static const struct diag_check *s_checks[DIAG_MAX_CHECKS];
+static size_t                    s_n_checks = 0;
+
+int diag_register(const struct diag_check *check)
+{
+    if (!check || !check->run || !check->name)
+        return -1;
+
+    /* Idempotent: same pointer twice is a no-op. */
+    for (size_t i = 0; i < s_n_checks; i++) {
+        if (s_checks[i] == check)
+            return 0;
+    }
+    if (s_n_checks >= DIAG_MAX_CHECKS)
+        return -1;
+    s_checks[s_n_checks++] = check;
+    return 0;
+}
+
+/*
+ * domain_label -- printable string for the most common domain mask
+ * values.  Used in the report header so users know which set of
+ * checks ran without parsing the per-line output.
+ */
+static const char *domain_label(unsigned domains)
+{
+    if (domains == DIAG_DOMAIN_TLS)  return "NFS-over-TLS";
+    if (domains == DIAG_DOMAIN_KRB5) return "NFS-over-Kerberos";
+    if (domains == DIAG_DOMAIN_ALL)  return "NFS (all domains)";
+    return "NFS";
+}
+
+int diag_run(unsigned domains)
+{
+    enum diag_verdict total = DIAG_PASS;
+    int matched = 0;
+
+    printf("nfs-test-tools diagnose: pre-flight checks for %s\n",
+           domain_label(domains));
+    printf("------------------------------------------------------------\n");
+
+    for (size_t i = 0; i < s_n_checks; i++) {
+        const struct diag_check *c = s_checks[i];
+        if ((c->domains & domains) == 0)
+            continue;
+        matched++;
+        total = diag_combine(total, c->run());
+    }
+
+    printf("------------------------------------------------------------\n");
+    if (matched == 0) {
+        printf("Overall: ?  (no checks registered for the requested "
+               "domain mask 0x%x)\n", domains);
+        return DIAG_WARN;
+    }
+    printf("Overall: %s\n", diag_verdict_str(total));
+    return (int)total;
+}
+
+/* --- TLS check registration ------------------------------------- */
+
+/*
+ * One static const struct diag_check per existing check function.
+ * The function names and check identifiers are unchanged from the
+ * pre-registry implementation, so the per-line "DIAG: <name>:" output
+ * is bit-for-bit identical when --diagnose runs against the TLS
+ * domain.
+ */
+static const struct diag_check s_check_kernel_version = {
+    .name    = "kernel-version",
+    .domains = DIAG_DOMAIN_TLS | DIAG_DOMAIN_KRB5,
+    .run     = check_kernel_version,
+};
+static const struct diag_check s_check_sunrpc_tls = {
+    .name    = "kernel-config",
+    .domains = DIAG_DOMAIN_TLS,
+    .run     = check_sunrpc_tls,
+};
+static const struct diag_check s_check_tls_module = {
+    .name    = "tls-module",
+    .domains = DIAG_DOMAIN_TLS,
+    .run     = check_tls_module,
+};
+static const struct diag_check s_check_tlshd = {
+    .name    = "tlshd",
+    .domains = DIAG_DOMAIN_TLS,
+    .run     = check_tlshd,
+};
+static const struct diag_check s_check_openssl = {
+    .name    = "openssl-version",
+    .domains = DIAG_DOMAIN_TLS,
+    .run     = check_openssl,
+};
+
+void diag_init_tls(void)
+{
+    diag_register(&s_check_kernel_version);
+    diag_register(&s_check_sunrpc_tls);
+    diag_register(&s_check_tls_module);
+    diag_register(&s_check_tlshd);
+    diag_register(&s_check_openssl);
+}
+
+/* --- backward-compatible diagnose_run --------------------------- */
 
 int diagnose_run(void)
 {
-    enum verdict total = V_PASS;
-
-    printf("nfs-test-tools diagnose: pre-flight checks for NFS-over-TLS\n");
-    printf("------------------------------------------------------------\n");
-
-    total = combine(total, check_kernel_version());
-    total = combine(total, check_sunrpc_tls());
-    total = combine(total, check_tls_module());
-    total = combine(total, check_tlshd());
-    total = combine(total, check_openssl());
-
-    printf("------------------------------------------------------------\n");
-    printf("Overall: %s\n", verdict_str(total));
-
-    return (int)total;
+    diag_init_tls();
+    return diag_run(DIAG_DOMAIN_TLS);
 }
 
 /* --- cert-info mode --- */
@@ -308,7 +424,7 @@ static X509 *load_x509(const char *path)
     if (!fp) {
         char buf[300];
         snprintf(buf, sizeof(buf), "%s: %s", path, strerror(errno));
-        emit("cert-load", V_FAIL, buf);
+        emit("cert-load", DIAG_FAIL, buf);
         return NULL;
     }
     X509 *cert = PEM_read_X509(fp, NULL, NULL, NULL);
@@ -316,7 +432,7 @@ static X509 *load_x509(const char *path)
     if (!cert) {
         char buf[300];
         snprintf(buf, sizeof(buf), "%s: PEM parse failed", path);
-        emit("cert-load", V_FAIL, buf);
+        emit("cert-load", DIAG_FAIL, buf);
         return NULL;
     }
     return cert;
@@ -328,7 +444,7 @@ static EVP_PKEY *load_pkey(const char *path)
     if (!fp) {
         char buf[300];
         snprintf(buf, sizeof(buf), "%s: %s", path, strerror(errno));
-        emit("key-load", V_FAIL, buf);
+        emit("key-load", DIAG_FAIL, buf);
         return NULL;
     }
     EVP_PKEY *pk = PEM_read_PrivateKey(fp, NULL, NULL, NULL);
@@ -336,7 +452,7 @@ static EVP_PKEY *load_pkey(const char *path)
     if (!pk) {
         char buf[300];
         snprintf(buf, sizeof(buf), "%s: PEM parse failed", path);
-        emit("key-load", V_FAIL, buf);
+        emit("key-load", DIAG_FAIL, buf);
         return NULL;
     }
     return pk;
@@ -346,18 +462,18 @@ static EVP_PKEY *load_pkey(const char *path)
  * Print the cert subject, issuer, validity period, and SAN.
  * Returns the verdict for the validity period (cert expired -> FAIL).
  */
-static enum verdict report_cert_basics(X509 *cert)
+static enum diag_verdict report_cert_basics(X509 *cert)
 {
-    enum verdict v = V_PASS;
+    enum diag_verdict v = DIAG_PASS;
 
     char *subj = X509_NAME_oneline(X509_get_subject_name(cert), NULL, 0);
     char *iss  = X509_NAME_oneline(X509_get_issuer_name(cert),  NULL, 0);
     if (subj) {
-        emit("cert-subject", V_PASS, subj);
+        emit("cert-subject", DIAG_PASS, subj);
         OPENSSL_free(subj);
     }
     if (iss) {
-        emit("cert-issuer", V_PASS, iss);
+        emit("cert-issuer", DIAG_PASS, iss);
         OPENSSL_free(iss);
     }
 
@@ -367,30 +483,30 @@ static enum verdict report_cert_basics(X509 *cert)
 
     int day = 0, sec = 0;
     if (ASN1_TIME_diff(&day, &sec, NULL, nb) && (day > 0 || sec > 0)) {
-        emit("cert-validity", V_FAIL, "not yet valid (notBefore in future)");
-        v = V_FAIL;
+        emit("cert-validity", DIAG_FAIL, "not yet valid (notBefore in future)");
+        v = DIAG_FAIL;
     } else if (ASN1_TIME_diff(&day, &sec, NULL, na) && day < 0) {
         char buf[128];
         snprintf(buf, sizeof(buf), "expired %d day(s) ago", -day);
-        emit("cert-validity", V_FAIL, buf);
-        v = V_FAIL;
+        emit("cert-validity", DIAG_FAIL, buf);
+        v = DIAG_FAIL;
     } else if (day < 30) {
         char buf[128];
         snprintf(buf, sizeof(buf), "expires in %d day(s)", day);
-        emit("cert-validity", V_WARN, buf);
-        v = combine(v, V_WARN);
+        emit("cert-validity", DIAG_WARN, buf);
+        v = combine(v, DIAG_WARN);
     } else {
         char buf[128];
         snprintf(buf, sizeof(buf), "valid for %d more day(s)", day);
-        emit("cert-validity", V_PASS, buf);
+        emit("cert-validity", DIAG_PASS, buf);
     }
 
     /* SAN */
     STACK_OF(GENERAL_NAME) *sans = X509_get_ext_d2i(cert,
         NID_subject_alt_name, NULL, NULL);
     if (!sans) {
-        emit("cert-san", V_WARN, "no subjectAltName extension");
-        v = combine(v, V_WARN);
+        emit("cert-san", DIAG_WARN, "no subjectAltName extension");
+        v = combine(v, DIAG_WARN);
     } else {
         /*
          * Build a comma-separated SAN summary into buf.  Each snprintf
@@ -447,7 +563,7 @@ static enum verdict report_cert_basics(X509 *cert)
             }
             pos += (size_t)written;
         }
-        emit("cert-san", V_PASS, buf);
+        emit("cert-san", DIAG_PASS, buf);
         sk_GENERAL_NAME_pop_free(sans, GENERAL_NAME_free);
     }
 
@@ -457,11 +573,11 @@ static enum verdict report_cert_basics(X509 *cert)
 /*
  * Verify cert/key modulus match.
  */
-static enum verdict report_cert_key_match(X509 *cert, EVP_PKEY *key)
+static enum diag_verdict report_cert_key_match(X509 *cert, EVP_PKEY *key)
 {
     if (X509_check_private_key(cert, key) == 1) {
-        emit("cert-key-match", V_PASS, "certificate and key match");
-        return V_PASS;
+        emit("cert-key-match", DIAG_PASS, "certificate and key match");
+        return DIAG_PASS;
     }
     char buf[256];
     unsigned long e = ERR_peek_last_error();
@@ -469,49 +585,49 @@ static enum verdict report_cert_key_match(X509 *cert, EVP_PKEY *key)
         ERR_error_string_n(e, buf, sizeof(buf));
     else
         snprintf(buf, sizeof(buf), "modulus mismatch");
-    emit("cert-key-match", V_FAIL, buf);
-    return V_FAIL;
+    emit("cert-key-match", DIAG_FAIL, buf);
+    return DIAG_FAIL;
 }
 
 /*
  * Verify the cert against a CA bundle using openssl's chain validation.
  */
-static enum verdict report_chain(X509 *cert, const char *ca_path)
+static enum diag_verdict report_chain(X509 *cert, const char *ca_path)
 {
     X509_STORE *store = X509_STORE_new();
     if (!store) {
-        emit("cert-chain", V_FAIL, "X509_STORE_new failed");
-        return V_FAIL;
+        emit("cert-chain", DIAG_FAIL, "X509_STORE_new failed");
+        return DIAG_FAIL;
     }
 
     if (X509_STORE_load_locations(store, ca_path, NULL) != 1) {
         char buf[300];
         snprintf(buf, sizeof(buf), "load CA from %s failed", ca_path);
-        emit("cert-chain", V_FAIL, buf);
+        emit("cert-chain", DIAG_FAIL, buf);
         X509_STORE_free(store);
-        return V_FAIL;
+        return DIAG_FAIL;
     }
 
     X509_STORE_CTX *ctx = X509_STORE_CTX_new();
     if (!ctx) {
-        emit("cert-chain", V_FAIL, "X509_STORE_CTX_new failed");
+        emit("cert-chain", DIAG_FAIL, "X509_STORE_CTX_new failed");
         X509_STORE_free(store);
-        return V_FAIL;
+        return DIAG_FAIL;
     }
 
     X509_STORE_CTX_init(ctx, store, cert, NULL);
     int ok = X509_verify_cert(ctx);
-    enum verdict v;
+    enum diag_verdict v;
     if (ok == 1) {
-        emit("cert-chain", V_PASS, "verified against CA");
-        v = V_PASS;
+        emit("cert-chain", DIAG_PASS, "verified against CA");
+        v = DIAG_PASS;
     } else {
         int err = X509_STORE_CTX_get_error(ctx);
         const char *reason = X509_verify_cert_error_string(err);
         char buf[300];
         snprintf(buf, sizeof(buf), "verify failed: %s", reason);
-        emit("cert-chain", V_FAIL, buf);
-        v = V_FAIL;
+        emit("cert-chain", DIAG_FAIL, buf);
+        v = DIAG_FAIL;
     }
     X509_STORE_CTX_free(ctx);
     X509_STORE_free(store);
@@ -522,22 +638,22 @@ static enum verdict report_chain(X509 *cert, const char *ca_path)
  * Check that all required SAN entries are present.
  * required is comma-separated "IP:..."/"DNS:..."/bare values.
  */
-static enum verdict report_required_san(X509 *cert, const char *required)
+static enum diag_verdict report_required_san(X509 *cert, const char *required)
 {
     STACK_OF(GENERAL_NAME) *sans = X509_get_ext_d2i(cert,
         NID_subject_alt_name, NULL, NULL);
     if (!sans) {
-        emit("cert-required-san", V_FAIL, "cert has no SAN extension");
-        return V_FAIL;
+        emit("cert-required-san", DIAG_FAIL, "cert has no SAN extension");
+        return DIAG_FAIL;
     }
 
     char *copy = strdup(required);
     if (!copy) {
         sk_GENERAL_NAME_pop_free(sans, GENERAL_NAME_free);
-        return V_FAIL;
+        return DIAG_FAIL;
     }
 
-    enum verdict v = V_PASS;
+    enum diag_verdict v = DIAG_PASS;
     char *save = NULL;
     for (char *tok = strtok_r(copy, ",", &save); tok;
          tok = strtok_r(NULL, ",", &save)) {
@@ -586,14 +702,14 @@ static enum verdict report_required_san(X509 *cert, const char *required)
         if (!found) {
             char buf[200];
             snprintf(buf, sizeof(buf), "missing: %s", tok);
-            emit("cert-required-san", V_FAIL, buf);
-            v = V_FAIL;
+            emit("cert-required-san", DIAG_FAIL, buf);
+            v = DIAG_FAIL;
             break;
         }
     }
 
-    if (v == V_PASS)
-        emit("cert-required-san", V_PASS, "all required entries present");
+    if (v == DIAG_PASS)
+        emit("cert-required-san", DIAG_PASS, "all required entries present");
 
     free(copy);
     sk_GENERAL_NAME_pop_free(sans, GENERAL_NAME_free);
@@ -603,20 +719,20 @@ static enum verdict report_required_san(X509 *cert, const char *required)
 int cert_info_run(const char *cert_path, const char *key_path,
                   const char *ca_path, const char *required_san)
 {
-    enum verdict total = V_PASS;
+    enum diag_verdict total = DIAG_PASS;
 
     printf("nfs-test-tools cert-info: certificate diagnostics\n");
     printf("------------------------------------------------------------\n");
 
     if (!cert_path) {
-        emit("cert-load", V_FAIL, "no --cert specified");
+        emit("cert-load", DIAG_FAIL, "no --cert specified");
         return 1;
     }
 
     if (!file_exists(cert_path)) {
         char buf[300];
         snprintf(buf, sizeof(buf), "%s: not a regular file", cert_path);
-        emit("cert-load", V_FAIL, buf);
+        emit("cert-load", DIAG_FAIL, buf);
         return 1;
     }
 
@@ -630,12 +746,12 @@ int cert_info_run(const char *cert_path, const char *key_path,
         if (!file_exists(key_path)) {
             char buf[300];
             snprintf(buf, sizeof(buf), "%s: not a regular file", key_path);
-            emit("key-load", V_FAIL, buf);
-            total = combine(total, V_FAIL);
+            emit("key-load", DIAG_FAIL, buf);
+            total = combine(total, DIAG_FAIL);
         } else {
             EVP_PKEY *key = load_pkey(key_path);
             if (!key) {
-                total = combine(total, V_FAIL);
+                total = combine(total, DIAG_FAIL);
             } else {
                 total = combine(total, report_cert_key_match(cert, key));
                 EVP_PKEY_free(key);
@@ -647,8 +763,8 @@ int cert_info_run(const char *cert_path, const char *key_path,
         if (!file_exists(ca_path)) {
             char buf[300];
             snprintf(buf, sizeof(buf), "%s: not a regular file", ca_path);
-            emit("ca-load", V_FAIL, buf);
-            total = combine(total, V_FAIL);
+            emit("ca-load", DIAG_FAIL, buf);
+            total = combine(total, DIAG_FAIL);
         } else {
             total = combine(total, report_chain(cert, ca_path));
         }
