@@ -33,6 +33,17 @@ AC_SUBST([GSSAPI_CFLAGS])
 AC_SUBST([GSSAPI_LIBS])
 AM_CONDITIONAL([HAVE_GSSAPI], [test "x$have_gssapi" = xyes])
 
+# Check for <krb5.h> for numeric minor-status classification table.
+# Use GSSAPI_CFLAGS so the include path matches the selected GSSAPI library.
+have_krb5_h=no
+AS_IF([test "x$have_gssapi" = xyes], [
+    save_CPPFLAGS="$CPPFLAGS"
+    CPPFLAGS="$CPPFLAGS $GSSAPI_CFLAGS"
+    AC_CHECK_HEADERS([krb5.h], [have_krb5_h=yes])
+    CPPFLAGS="$save_CPPFLAGS"
+])
+AM_CONDITIONAL([HAVE_KRB5_H], [test "x$have_krb5_h" = xyes])
+
 AC_CONFIG_FILES([Makefile src/Makefile tests/Makefile])
 AC_OUTPUT
 
@@ -40,4 +51,5 @@ echo ""
 echo "nfs-test-tools configuration:"
 echo "  OpenSSL  : yes"
 echo "  GSSAPI   : $have_gssapi"
+echo "  krb5.h   : $have_krb5_h (numeric minor-status table)"
 echo ""

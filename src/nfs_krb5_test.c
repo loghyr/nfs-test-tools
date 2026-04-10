@@ -327,6 +327,74 @@ static int parse_gss_init_reply(const uint8_t *body, size_t body_len,
  * --------------------------------------------------------------------- */
 
 /*
+ * Numeric minor-status table (MIT krb5 only).
+ *
+ * When built with <krb5.h> available (HAVE_KRB5_H), we first attempt a
+ * direct numeric comparison of the GSS minor status against known MIT
+ * krb5 error constants.  This is faster, locale-independent, and more
+ * precise than substring matching.
+ *
+ * Each entry maps one MIT krb5_error_code constant (cast to OM_uint32
+ * for comparison against the GSS minor status, which is OM_uint32) to
+ * the corresponding entry in our canonical taxonomy.
+ *
+ * Constants chosen to cover the patterns in the string-matching block
+ * below.  Multiple MIT codes can map to the same taxonomy entry; list
+ * them as separate rows.
+ *
+ * This table is MIT-specific.  Heimdal uses different numeric values
+ * for the same conditions (e.g. Heimdal defines KRB5_KDC_UNREACH but
+ * assigns it a different integer).  When <krb5.h> is not available or
+ * is not the MIT header, we fall through to the string-matching path,
+ * which handles both MIT and Heimdal phrasings via gss_display_status.
+ */
+#ifdef HAVE_KRB5_H
+#include <krb5.h>
+
+struct mit_minor_entry {
+    OM_uint32            me_min;  /* MIT code cast to OM_uint32 */
+    enum krb5_error_code me_code; /* canonical taxonomy entry */
+};
+
+/* Table sorted by me_min; a linear scan is fine for this size. */
+static const struct mit_minor_entry mit_minor_table[] = {
+    { (OM_uint32)KRB5KDC_ERR_C_PRINCIPAL_UNKNOWN,  KRB5_ERR_PRINCIPAL_UNKNOWN },
+    { (OM_uint32)KRB5KDC_ERR_S_PRINCIPAL_UNKNOWN,  KRB5_ERR_PRINCIPAL_UNKNOWN },
+    { (OM_uint32)KRB5KDC_ERR_ETYPE_NOSUPP,         KRB5_ERR_BAD_ENCTYPE       },
+    { (OM_uint32)KRB5KDC_ERR_PREAUTH_FAILED,        KRB5_ERR_PREAUTH_FAILED    },
+    { (OM_uint32)KRB5KRB_AP_ERR_BAD_INTEGRITY,      KRB5_ERR_BAD_INTEGRITY     },
+    { (OM_uint32)KRB5KRB_AP_ERR_TKT_EXPIRED,        KRB5_ERR_TGT_EXPIRED       },
+    { (OM_uint32)KRB5KRB_AP_ERR_TKT_NYV,            KRB5_ERR_TGT_NOT_YET_VALID },
+    { (OM_uint32)KRB5KRB_AP_ERR_SKEW,               KRB5_ERR_CLOCK_SKEW        },
+    { (OM_uint32)KRB5KRB_AP_ERR_BADKEYVER,          KRB5_ERR_BAD_KVNO          },
+    { (OM_uint32)KRB5KDC_ERR_WRONG_REALM,           KRB5_ERR_BAD_REALM         },
+    { (OM_uint32)KRB5_CC_NOTFOUND,                  KRB5_ERR_NO_TGT            },
+    { (OM_uint32)KRB5_PROG_ETYPE_NOSUPP,            KRB5_ERR_BAD_ENCTYPE       },
+    { (OM_uint32)KRB5_KDC_UNREACH,                  KRB5_ERR_KDC_UNREACHABLE   },
+    { (OM_uint32)KRB5_KT_NOTFOUND,                  KRB5_ERR_KEYTAB_NO_PRINCIPAL},
+    { (OM_uint32)KRB5_KT_IOERR,                     KRB5_ERR_KEYTAB_NOT_READABLE},
+    { (OM_uint32)KRB5_FCC_NOFILE,                   KRB5_ERR_NO_TGT            },
+    { (OM_uint32)KRB5_REALM_CANT_RESOLVE,           KRB5_ERR_KDC_UNREACHABLE   },
+};
+#define MIT_MINOR_TABLE_LEN \
+    (sizeof(mit_minor_table) / sizeof(mit_minor_table[0]))
+
+/*
+ * krb5_classify_minor_numeric -- fast-path numeric lookup for MIT krb5.
+ * Returns KRB5_ERR_GSS_INIT_FAILED if min is not in the table.
+ */
+static enum krb5_error_code
+krb5_classify_minor_numeric(OM_uint32 min)
+{
+    for (size_t i = 0; i < MIT_MINOR_TABLE_LEN; i++) {
+        if (mit_minor_table[i].me_min == min)
+            return mit_minor_table[i].me_code;
+    }
+    return KRB5_ERR_GSS_INIT_FAILED;
+}
+#endif /* HAVE_KRB5_H */
+
+/*
  * krb5_classify_gss -- map a GSS-API (major, minor) status pair into a
  * canonical krb5_error_code from the taxonomy in krb5_error.h.
  *
@@ -371,10 +439,18 @@ krb5_classify_gss(OM_uint32 maj, OM_uint32 min, gss_OID mech)
     if (routine == GSS_S_BAD_SIG)              return KRB5_ERR_GSS_BAD_MIC;
 
     /*
-     * Mech-specific minor: walk the GSS message context until we get
-     * a string we can recognise, or until display_status reports
-     * GSS_S_COMPLETE with no further messages.
+     * Mech-specific minor: try the fast numeric table first (MIT only),
+     * then fall back to gss_display_status string matching which handles
+     * both MIT and Heimdal.
      */
+#ifdef HAVE_KRB5_H
+    {
+        enum krb5_error_code numeric = krb5_classify_minor_numeric(min);
+        if (numeric != KRB5_ERR_GSS_INIT_FAILED)
+            return numeric;
+    }
+#endif
+
     OM_uint32           ms;
     OM_uint32           message_context = 0;
     enum krb5_error_code matched = KRB5_ERR_GSS_INIT_FAILED;

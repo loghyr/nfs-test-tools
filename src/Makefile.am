@@ -39,4 +39,8 @@ nfs_krb5_test_SOURCES = \
 	diagnose_krb5.c
 nfs_krb5_test_CFLAGS  = $(GSSAPI_CFLAGS)
 nfs_krb5_test_LDADD   = $(GSSAPI_LIBS) -lpthread
+
+if HAVE_KRB5_H
+nfs_krb5_test_CFLAGS += -DHAVE_KRB5_H
+endif
 endif
