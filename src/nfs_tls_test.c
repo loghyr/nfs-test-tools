@@ -444,7 +444,7 @@ static void usage(const char *prog)
 		"  --check-san LIST      Verify server cert SAN includes these entries\n"
 		"                        (comma-separated 'IP:...,DNS:...')\n"
 		"  --require-tls13       Treat anything below TLS 1.3 as a failure\n"
-		"  --require-alpn NAME   Require this ALPN protocol (default: 'sunrpc')\n"
+		"  --require-alpn NAME   Require this ALPN protocol (default: not checked)\n"
 		"\n"
 		"Tests RFC 9289 RPC-over-TLS (STARTTLS): AUTH_TLS probe, TLS handshake,\n"
 		"ALPN 'sunrpc' verification, optional NFS NULL call over TLS.\n",

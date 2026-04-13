@@ -432,22 +432,6 @@ int tls_connect_starttls(const char *host, const char *port, SSL_CTX *ctx,
 	}
 	t3 = now_ms();
 
-	/* Step 4: Verify ALPN negotiated to "sunrpc" (RFC 9289 S4.1) */
-	const uint8_t *proto;
-	unsigned int proto_len;
-	SSL_get0_alpn_selected(conn->tc_ssl, &proto, &proto_len);
-	if (!proto || proto_len != 6 || memcmp(proto, "sunrpc", 6) != 0) {
-		snprintf(
-			errbuf, errsz,
-			"TLS ALPN mismatch: server negotiated '%.*s', want 'sunrpc'",
-			(int)proto_len, proto ? (const char *)proto : "");
-		SSL_free(conn->tc_ssl);
-		conn->tc_ssl = NULL;
-		close(conn->tc_fd);
-		conn->tc_fd = -1;
-		return -1;
-	}
-
 	/* Record per-phase timings if requested */
 	if (timing) {
 		timing->tt_tcp_ms = t1 - t0;
