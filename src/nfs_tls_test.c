@@ -780,15 +780,21 @@ static void print_report(const struct options *o, struct worker *workers,
 		{ fail_hs, TLS_PHASE_HANDSHAKE },
 		{ fail_rpc, TLS_PHASE_RPC },
 	};
+	/*
+	 * Suppress the diagnostic hints when --expect-fail is active:
+	 * the failures are intentional and the hint is noise.
+	 */
 	int any_phase_failed = 0;
 	for (size_t i = 0; i < sizeof(phase_summary) / sizeof(phase_summary[0]);
 	     i++) {
 		if (phase_summary[i].count <= 0)
 			continue;
-		if (!any_phase_failed) {
+		if (!any_phase_failed && !o->o_expect_fail) {
 			printf("\nMost likely causes (see TROUBLESHOOTING.md for details):\n");
 			any_phase_failed = 1;
 		}
+		if (o->o_expect_fail)
+			continue;
 		char ctx[64];
 		snprintf(ctx, sizeof(ctx), "%ld %s failure%s",
 			 phase_summary[i].count,
