@@ -1,4 +1,4 @@
-<!-- SPDX-License-Identifier: Apache-2.0 -->
+<!-- SPDX-License-Identifier: BSD-2-Clause OR GPL-2.0-only -->
 
 # nfs-test-tools -- protocol-level NFS test utilities
 
@@ -605,4 +605,7 @@ failure diagnosis reference for AI-assisted analysis.
 
 ## License
 
-Apache-2.0. See [LICENSE](LICENSE) for the full text.
+Dual-licensed: `BSD-2-Clause OR GPL-2.0-only` at your option.  This
+lets the code flow into both the permissive BSD/macOS/Solaris NFS
+test ecosystems and the GPLv2 Linux NFS ecosystem (kernel, nfs-utils,
+ktls-utils, tlshd).  See [LICENSE](LICENSE) for the full text.

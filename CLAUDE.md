@@ -1,4 +1,4 @@
-<!-- SPDX-License-Identifier: Apache-2.0 -->
+<!-- SPDX-License-Identifier: BSD-2-Clause OR GPL-2.0-only -->
 
 # nfs-test-tools — Claude Code Project Instructions
 
@@ -10,8 +10,8 @@
 
 ## License
 
-- All code: Apache-2.0
-- SPDX headers required on all files
+- All code: dual `BSD-2-Clause OR GPL-2.0-only` (recipient's choice)
+- SPDX headers required on all files: `SPDX-License-Identifier: BSD-2-Clause OR GPL-2.0-only`
 - Co-Authored-By lines are permitted in this repo
 
 ## Git conventions
