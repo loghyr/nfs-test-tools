@@ -80,6 +80,7 @@ struct options {
 	const char *o_require_alpn; /* required ALPN protocol, or NULL */
 	int o_json; /* 1 = emit JSON-only report on stdout */
 	int o_print_error_table; /* 1 = dump error taxonomy and exit */
+	int o_expect_fail; /* 1 = invert: all connections should fail */
 };
 
 /* --- per-worker state --- */
@@ -445,6 +446,9 @@ static void usage(const char *prog)
 		"                        (comma-separated 'IP:...,DNS:...')\n"
 		"  --require-tls13       Treat anything below TLS 1.3 as a failure\n"
 		"  --require-alpn NAME   Require this ALPN protocol (default: not checked)\n"
+		"  --expect-fail         Invert: exit 0 if ALL connections fail, non-zero\n"
+		"                        if any succeed.  Used for negative tests (wrong\n"
+		"                        CA cert, expired cert, revoked cert).\n"
 		"\n"
 		"Tests RFC 9289 RPC-over-TLS (STARTTLS): AUTH_TLS probe, TLS handshake,\n"
 		"ALPN 'sunrpc' verification, optional NFS NULL call over TLS.\n",
@@ -479,6 +483,7 @@ static void parse_options(int argc, char **argv, struct options *o)
 		{ "require-alpn", required_argument, NULL, 'N' },
 		{ "output", required_argument, NULL, 'O' },
 		{ "print-error-table", no_argument, NULL, 'E' },
+		{ "expect-fail", no_argument, NULL, 'X' },
 		{ NULL, 0, NULL, 0 }
 	};
 
@@ -571,6 +576,9 @@ static void parse_options(int argc, char **argv, struct options *o)
 			break;
 		case 'E':
 			o->o_print_error_table = 1;
+			break;
+		case 'X':
+			o->o_expect_fail = 1;
 			break;
 		default:
 			usage(argv[0]);
@@ -1132,9 +1140,12 @@ int main(int argc, char **argv)
      * with the standard 0/1/2 shell convention badly, and are stable
      * across releases per the tls_error.h taxonomy.
      */
+	long total_ok_count = 0;
 	long fail_tcp_total = 0, fail_probe_total = 0;
 	long fail_hs_total = 0, fail_rpc_total = 0;
 	for (int i = 0; i < nworkers; i++) {
+		total_ok_count += atomic_load_explicit(&workers[i].w_ok,
+						       memory_order_relaxed);
 		fail_tcp_total += atomic_load_explicit(&workers[i].w_fail_tcp,
 						       memory_order_relaxed);
 		fail_probe_total += atomic_load_explicit(
@@ -1177,6 +1188,27 @@ int main(int argc, char **argv)
 		exit_code = single_code;
 	else
 		exit_code = TLS_ERR_MIXED;
+
+	/*
+	 * --expect-fail: invert the exit status for negative tests.
+	 * Success means ALL connections failed (e.g. wrong CA cert);
+	 * failure means at least one connection unexpectedly succeeded.
+	 */
+	if (o.o_expect_fail) {
+		if (total_ok_count == 0 && total_fail > 0) {
+			printf("All %ld connections failed as expected "
+			       "(--expect-fail OK).\n",
+			       total_fail);
+			exit_code = TLS_ERR_OK;
+		} else {
+			fprintf(stderr,
+				"EXPECT-FAIL violated: %ld/%ld connections "
+				"succeeded (all should have failed).\n",
+				total_ok_count,
+				total_ok_count + total_fail);
+			exit_code = TLS_ERR_MIXED;
+		}
+	}
 
 	/* Cleanup */
 	for (int i = 0; i < nworkers; i++) {
