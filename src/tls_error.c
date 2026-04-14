@@ -97,6 +97,13 @@ static const struct nfs_error_info s_tls_entries[] = {
 	  "Enable TLS in the server's NFS config (e.g. tls=y in nfs.conf)",
 	  "probe_no_starttls" },
 
+	{ TLS_ERR_TLS_ENABLED_UNEXPECTEDLY, TLS_PHASE_PROBE,
+	  "TLS_ENABLED_UNEXPECTEDLY",
+	  "Server accepted the AUTH_TLS probe but policy says TLS is not enabled",
+	  "Server is violating RFC 9289 S4.1 by answering MSG_ACCEPTED when TLS "
+	  "is disabled; it should return MSG_DENIED/AUTH_REJECTEDCRED",
+	  "tls_enabled_unexpectedly" },
+
 	/* TLS handshake */
 	{ TLS_ERR_HANDSHAKE_FAILED, TLS_PHASE_HANDSHAKE, "HANDSHAKE_FAILED",
 	  "TLS handshake failed for an unspecified reason",

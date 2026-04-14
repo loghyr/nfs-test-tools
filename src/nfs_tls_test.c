@@ -80,6 +80,13 @@ struct options {
 	const char *o_require_alpn; /* required ALPN protocol, or NULL */
 	int o_json; /* 1 = emit JSON-only report on stdout */
 	int o_print_error_table; /* 1 = dump error taxonomy and exit */
+	int o_expect_no_tls; /* 1 = probe-only, expect MSG_DENIED; fail
+			      *     with TLS_ERR_TLS_ENABLED_UNEXPECTEDLY
+			      *     if server answers MSG_ACCEPTED.
+			      *     Tests server-side RFC 9289 S4.1:
+			      *     a server without TLS enabled must
+			      *     return MSG_DENIED to the AUTH_TLS
+			      *     probe, not MSG_ACCEPTED. */
 };
 
 /* --- per-worker state --- */
@@ -440,6 +447,12 @@ static void usage(const char *prog)
 		"Diagnostic and strict-mode options:\n"
 		"  --diagnose            Run local pre-flight checks and exit\n"
 		"  --print-error-table   Print the canonical error taxonomy and exit\n"
+		"  --expect-no-tls       Probe-only negative test.  Asserts the server\n"
+		"                        answers the AUTH_TLS NULL probe with MSG_DENIED\n"
+		"                        (RFC 9289 S4.1 correct behaviour for servers\n"
+		"                        without TLS enabled).  Exits with\n"
+		"                        TLS_ENABLED_UNEXPECTEDLY (code 33) if the\n"
+		"                        server answers MSG_ACCEPTED.  No handshake.\n"
 		"  --keylog FILE         Write NSS-format TLS key log for Wireshark\n"
 		"  --check-san LIST      Verify server cert SAN includes these entries\n"
 		"                        (comma-separated 'IP:...,DNS:...')\n"
@@ -479,6 +492,7 @@ static void parse_options(int argc, char **argv, struct options *o)
 		{ "require-alpn", required_argument, NULL, 'N' },
 		{ "output", required_argument, NULL, 'O' },
 		{ "print-error-table", no_argument, NULL, 'E' },
+		{ "expect-no-tls", no_argument, NULL, 'X' },
 		{ NULL, 0, NULL, 0 }
 	};
 
@@ -571,6 +585,9 @@ static void parse_options(int argc, char **argv, struct options *o)
 			break;
 		case 'E':
 			o->o_print_error_table = 1;
+			break;
+		case 'X':
+			o->o_expect_no_tls = 1;
 			break;
 		default:
 			usage(argv[0]);
@@ -976,6 +993,55 @@ int main(int argc, char **argv)
 	if (o.o_print_error_table) {
 		tls_error_print_table();
 		return EXIT_SUCCESS;
+	}
+
+	/*
+	 * --expect-no-tls: negative-path probe.  Tests the server-side
+	 * RFC 9289 S4.1 requirement that a server without TLS enabled
+	 * must answer the AUTH_TLS NULL probe with MSG_DENIED.  Any
+	 * server that answers MSG_ACCEPTED while policy says TLS is
+	 * disabled is buggy.
+	 *
+	 *   MSG_DENIED   -> pass, exit TLS_ERR_OK (0)
+	 *   MSG_ACCEPTED -> fail, exit TLS_ERR_TLS_ENABLED_UNEXPECTEDLY (33)
+	 *   wire error   -> exit TLS_ERR_TCP_REFUSED / similar
+	 *
+	 * Runs before SSL_CTX creation -- no cert material is needed,
+	 * no TLS handshake is attempted.
+	 */
+	if (o.o_expect_no_tls) {
+		char errbuf[256];
+		uint32_t xid = (uint32_t)getpid();
+		enum tls_probe_result r = tls_probe_only(o.o_host, o.o_port,
+							 xid, errbuf,
+							 sizeof(errbuf));
+		switch (r) {
+		case TLS_PROBE_DENIED:
+			printf("AUTH_TLS probe to %s:%s: MSG_DENIED "
+			       "(server correctly refused TLS per RFC 9289 S4.1)\n",
+			       o.o_host, o.o_port);
+			return TLS_ERR_OK;
+		case TLS_PROBE_ACCEPTED: {
+			char ctx_str[128];
+			snprintf(ctx_str, sizeof(ctx_str),
+				 "server %s:%s answered MSG_ACCEPTED",
+				 o.o_host, o.o_port);
+			tls_error_emit_one(stderr,
+					   TLS_ERR_TLS_ENABLED_UNEXPECTEDLY,
+					   ctx_str);
+			return (int)TLS_ERR_TLS_ENABLED_UNEXPECTEDLY;
+		}
+		case TLS_PROBE_ERROR:
+		default:
+			/* TCP refused, truncated reply, XID mismatch, etc.
+			 * Classify via the errbuf prefix, same pattern the
+			 * worker uses. */
+			fprintf(stderr, "probe error: %s\n", errbuf);
+			if (strncmp(errbuf, "connect(", 8) == 0 ||
+			    strncmp(errbuf, "getaddrinfo", 11) == 0)
+				return (int)TLS_ERR_TCP_REFUSED;
+			return (int)TLS_ERR_PROBE_MALFORMED_REPLY;
+		}
 	}
 
 	SSL_CTX *ctx = tls_ctx_create(o.o_ca_cert, o.o_cert, o.o_key);

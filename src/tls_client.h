@@ -84,6 +84,47 @@ SSL_CTX *tls_ctx_create(const char *ca_cert, const char *cert, const char *key);
 int tls_ctx_enable_keylog(SSL_CTX *ctx, const char *keylog_path);
 
 /*
+ * enum tls_probe_result -- outcome of an AUTH_TLS NULL probe, one of
+ * the three states RFC 9289 S4.1 describes.
+ *
+ *   TLS_PROBE_ACCEPTED : server answered MSG_ACCEPTED with AUTH_TLS
+ *                        verifier (or similar accept shape).  Server
+ *                        supports STARTTLS on this listener.
+ *   TLS_PROBE_DENIED   : server answered MSG_DENIED (RFC 9289 says
+ *                        au_stat should be AUTH_REJECTEDCRED).  This
+ *                        is the spec-correct answer when TLS is not
+ *                        configured on the server.
+ *   TLS_PROBE_ERROR    : TCP failure, truncated / malformed reply,
+ *                        XID mismatch, etc.  errbuf is filled.
+ *
+ * Used by tls_probe_only() for negative-path testing (verifying that
+ * a server that is configured WITHOUT TLS actually denies the probe,
+ * rather than accepting it — a server-side RFC 9289 violation).
+ */
+enum tls_probe_result {
+	TLS_PROBE_ERROR = -1,
+	TLS_PROBE_DENIED = 0,
+	TLS_PROBE_ACCEPTED = 1,
+};
+
+/*
+ * tls_probe_only -- perform just the RFC 9289 AUTH_TLS NULL probe.
+ *
+ * TCP-connects to host:port, sends an AUTH_TLS NULL RPC call, reads
+ * the reply header, and classifies MSG_ACCEPTED vs MSG_DENIED vs
+ * malformed.  Closes the socket before returning in all cases.  Does
+ * NOT attempt a TLS handshake.
+ *
+ * Intended for negative testing: call with --expect-no-tls to assert
+ * a server advertised as TLS-disabled actually denies the probe.
+ *
+ * Returns one of enum tls_probe_result.
+ */
+enum tls_probe_result
+tls_probe_only(const char *host, const char *port, uint32_t xid, char *errbuf,
+	       size_t errsz);
+
+/*
  * tls_connect_starttls -- connect to host:port, perform RFC 9289 STARTTLS.
  *
  * Sends a NULL RPC call with AUTH_TLS credential, reads the reply, then

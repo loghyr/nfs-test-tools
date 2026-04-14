@@ -356,6 +356,110 @@ SSL_CTX *tls_ctx_create(const char *ca_cert, const char *cert, const char *key)
 	return ctx;
 }
 
+/*
+ * tls_probe_only -- TCP connect + AUTH_TLS NULL probe, then close.
+ *
+ * Distinguishes the three RFC 9289 S4.1 outcomes:
+ *   - MSG_ACCEPTED  -> TLS_PROBE_ACCEPTED (server supports STARTTLS)
+ *   - MSG_DENIED    -> TLS_PROBE_DENIED   (server correctly refuses)
+ *   - wire error    -> TLS_PROBE_ERROR    (errbuf filled)
+ *
+ * No TLS handshake is attempted.  The socket is closed before return
+ * in all cases.  This is the wire engine for nfs_tls_test's
+ * --expect-no-tls mode, which asserts that a server advertised as
+ * TLS-disabled actually denies the probe rather than accepting it
+ * (a server-side RFC 9289 violation).
+ */
+enum tls_probe_result
+tls_probe_only(const char *host, const char *port, uint32_t xid, char *errbuf,
+	       size_t errsz)
+{
+	int fd = tcp_connect(host, port, errbuf, errsz);
+	if (fd < 0)
+		return TLS_PROBE_ERROR;
+
+	if (send_auth_tls_probe(fd, xid, errbuf, errsz) < 0) {
+		close(fd);
+		return TLS_PROBE_ERROR;
+	}
+
+	/*
+	 * Read just enough of the reply to decide MSG_ACCEPTED vs
+	 * MSG_DENIED.  Everything past reply_stat (verifier, accept_stat)
+	 * is not needed to make that determination.
+	 */
+	uint8_t marker_buf[4];
+	if (rpc_readn(fd, marker_buf, 4) != 4) {
+		snprintf(errbuf, errsz, "read record marker: %s",
+			 errno ? strerror(errno) : "EOF");
+		close(fd);
+		return TLS_PROBE_ERROR;
+	}
+
+	size_t mpos = 0;
+	uint32_t marker;
+	rpc_get_u32(marker_buf, 4, &mpos, &marker);
+	if (!(marker & RPC_LAST_FRAG)) {
+		snprintf(errbuf, errsz,
+			 "STARTTLS probe reply: multi-fragment not expected");
+		close(fd);
+		return TLS_PROBE_ERROR;
+	}
+
+	uint32_t body_len = marker & ~RPC_LAST_FRAG;
+	if (body_len == 0 || body_len > STARTTLS_REPLY_MAX) {
+		snprintf(errbuf, errsz,
+			 "STARTTLS probe reply: implausible body length %u",
+			 body_len);
+		close(fd);
+		return TLS_PROBE_ERROR;
+	}
+
+	uint8_t body[STARTTLS_REPLY_MAX];
+	if (rpc_readn(fd, body, body_len) != (ssize_t)body_len) {
+		snprintf(errbuf, errsz, "read STARTTLS probe reply body: %s",
+			 errno ? strerror(errno) : "EOF");
+		close(fd);
+		return TLS_PROBE_ERROR;
+	}
+
+	close(fd); /* socket no longer needed regardless of outcome */
+
+	size_t pos = 0;
+	uint32_t got_xid, msg_type, reply_stat;
+
+	if (!rpc_get_u32(body, body_len, &pos, &got_xid) ||
+	    !rpc_get_u32(body, body_len, &pos, &msg_type) ||
+	    !rpc_get_u32(body, body_len, &pos, &reply_stat)) {
+		snprintf(errbuf, errsz, "STARTTLS probe reply: short header");
+		return TLS_PROBE_ERROR;
+	}
+	if (got_xid != xid) {
+		snprintf(errbuf, errsz,
+			 "STARTTLS probe reply: xid mismatch (got %u want %u)",
+			 got_xid, xid);
+		return TLS_PROBE_ERROR;
+	}
+	if (msg_type != RPC_REPLY) {
+		snprintf(errbuf, errsz,
+			 "STARTTLS probe reply: expected REPLY (1), got %u",
+			 msg_type);
+		return TLS_PROBE_ERROR;
+	}
+
+	if (reply_stat == RPC_MSG_ACCEPTED)
+		return TLS_PROBE_ACCEPTED;
+
+	/*
+	 * MSG_DENIED (reply_stat == 1).  RFC 9289 S4.1 says the server
+	 * SHOULD answer with rejection reason AUTH_ERROR and au_stat
+	 * AUTH_REJECTEDCRED when TLS is not available.  We accept any
+	 * MSG_DENIED shape as "correctly refused" for the purposes of
+	 * the probe; callers that care can parse further.
+	 */
+	return TLS_PROBE_DENIED;
+}
+
 int tls_connect_starttls(const char *host, const char *port, SSL_CTX *ctx,
 			 SSL_SESSION *session_in, struct tls_conn *conn,
 			 uint32_t xid, struct tls_timing *timing, char *errbuf,

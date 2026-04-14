@@ -924,6 +924,40 @@ Enable TLS in the server's NFS configuration (commonly `tls=y` in
 `/etc/nfs.conf` for Linux nfs-server, or the equivalent for the
 server vendor).
 
+### tls_enabled_unexpectedly
+
+The server answered the AUTH_TLS NULL probe with `MSG_ACCEPTED`, but
+the tester told us (via `--expect-no-tls`) that the server is
+supposed to have TLS disabled.  This is a **server-side RFC 9289
+violation**: per §4.1, a server without TLS enabled must answer the
+probe with `MSG_DENIED` (rejection reason `AUTH_ERROR`, `au_stat =
+AUTH_REJECTEDCRED`), not `MSG_ACCEPTED`.
+
+A concrete instance: a Hammerspace Anvil running with
+`tls_peer_mode = 0` in `/pd/fs/protod.conf` (TLS disabled globally)
+that still answers the AUTH_TLS probe with `MSG_ACCEPTED`.  The
+client then proceeds to the handshake, which may or may not succeed
+depending on whether the server has TLS certs loaded at all -- but
+the *probe answer itself* has lied, and the bug is in the probe
+handler, not in the handshake path.
+
+To reproduce:
+
+```
+nfs_tls_test --host <server-with-tls-off> --expect-no-tls
+```
+
+Exit code `33` (`TLS_ENABLED_UNEXPECTEDLY`) means the server
+answered `MSG_ACCEPTED`.  Exit code `0` means the server correctly
+answered `MSG_DENIED`.  Any other exit code means the probe itself
+failed (TCP refused, malformed reply, etc.) and the test is
+inconclusive.
+
+Fix: the server's RPC NULL handler for AUTH_TLS must check whether
+TLS is enabled on the listener before replying `MSG_ACCEPTED`.  When
+TLS is off, reply with an `MSG_DENIED` containing rejection reason
+`AUTH_ERROR` and `au_stat = AUTH_REJECTEDCRED`.
+
 ### handshake_failed
 
 Generic catch-all for `SSL_connect()` failure with no more specific
