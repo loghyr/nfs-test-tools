@@ -264,6 +264,19 @@ static int parse_gss_init_reply(const uint8_t *body, size_t body_len,
 		return -1;
 	}
 	uint32_t verf_padded = (verf_len + 3u) & ~3u;
+	/*
+	 * Save the INIT reply verifier so we can call gss_verify_mic on it
+	 * after context establishment.  The server's gss_get_mic over
+	 * htonl(seq_window) is the first use of the acceptor sequence
+	 * counter; skipping verification leaves our counter behind by one,
+	 * causing the DATA reply verifier to fail.
+	 */
+	if (verf_flavor == RPCSEC_GSS && verf_len > 0 &&
+	    verf_len <= sizeof(gc->gc_init_verf) &&
+	    pos + verf_len <= body_len) {
+		memcpy(gc->gc_init_verf, body + pos, verf_len);
+		gc->gc_init_verf_len = verf_len;
+	}
 	if (!rpc_skip(body_len, &pos, verf_padded)) {
 		snprintf(errbuf, errsz, "INIT reply: verifier truncated");
 		return -1;
@@ -316,6 +329,7 @@ static int parse_gss_init_reply(const uint8_t *body, size_t body_len,
 		snprintf(errbuf, errsz, "INIT resok: short gss status");
 		return -1;
 	}
+	gc->gc_init_seq_window = seq_window;
 
 	/* Token: opaque<> -- may be empty if context is complete */
 	uint32_t token_len;
@@ -1892,6 +1906,35 @@ int main(int argc, char **argv)
 
 	printf("  RPCSEC_GSS context established (handle_len=%u)\n",
 	       gc.gc_handle_len);
+
+	/*
+	 * Verify the saved INIT reply verifier (RFC 2203 S5.2.2.1).
+	 *
+	 * The server's first gss_get_mic call is over htonl(seq_window),
+	 * which advances the acceptor's internal sequence counter.  We must
+	 * call gss_verify_mic on that token to catch up; otherwise our
+	 * counter is behind by one and the DATA reply verifier (the server's
+	 * second gss_get_mic) appears out-of-sequence, producing
+	 * GSS_S_BAD_MIC or GSS_S_GAP_TOKEN on the first DATA call.
+	 */
+	if (gc.gc_init_verf_len > 0) {
+		uint32_t window_net = htonl(gc.gc_init_seq_window);
+		gss_buffer_desc msg_buf  = { .value  = &window_net,
+					     .length = 4 };
+		gss_buffer_desc verf_buf = { .value  = gc.gc_init_verf,
+					     .length = gc.gc_init_verf_len };
+		OM_uint32 qop_state;
+		maj_stat = gss_verify_mic(&min_stat, gc.gc_ctx, &msg_buf,
+					  &verf_buf, &qop_state);
+		if (opts.o_verbose)
+			printf("  INIT verifier verify: maj=0x%x min=0x%x\n",
+			       maj_stat, min_stat);
+		if (maj_stat != GSS_S_COMPLETE)
+			fprintf(stderr,
+				"WARNING: INIT reply verifier check failed: "
+				"maj=0x%x min=0x%x (continuing)\n",
+				maj_stat, min_stat);
+	}
 
 	/* --- DATA NULL calls ---
 	 *

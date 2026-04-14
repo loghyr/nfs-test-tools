@@ -348,6 +348,14 @@ int parse_data_reply_verifier(const uint8_t *body, size_t body_len,
 		mic_buf.value = (void *)(body + pos);
 		mic_buf.length = verf_len;
 
+		/* Debug: dump raw MIC token bytes */
+		fprintf(stderr, "DEBUG reply MIC (%u bytes, seq_num=%u):",
+			verf_len, gc->gc_seq_num);
+		for (uint32_t di = 0; di < verf_len; di++)
+			fprintf(stderr, " %02x",
+				((const uint8_t *)mic_buf.value)[di]);
+		fprintf(stderr, "\n");
+
 		uint8_t seq_buf[4];
 		size_t sq = 0;
 		if (!rpc_put_u32(seq_buf, 4, &sq, gc->gc_seq_num)) {

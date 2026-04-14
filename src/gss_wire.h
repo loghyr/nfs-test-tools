@@ -42,6 +42,19 @@ struct gss_ctx {
 	uint32_t gc_seq_num; /* last sequence number used for DATA */
 
 	/*
+	 * Saved INIT reply verifier for post-establishment verification.
+	 * RFC 2203 S5.2.2.1: the INIT verifier is the server's first
+	 * gss_get_mic call, over htonl(seq_window).  The client must
+	 * call gss_verify_mic on this token after the GSS context is
+	 * established; skipping it leaves the client's internal acceptor
+	 * sequence counter behind by one, causing the DATA reply verifier
+	 * (the server's second gss_get_mic) to fail.
+	 */
+	uint8_t  gc_init_verf[512];
+	uint32_t gc_init_verf_len;
+	uint32_t gc_init_seq_window;
+
+	/*
 	 * Optional mock injection for unit tests.  When non-NULL,
 	 * parse_data_reply_verifier() calls these instead of the real
 	 * GSSAPI functions.  Set by gss_ctx_defaults_init() to the real
