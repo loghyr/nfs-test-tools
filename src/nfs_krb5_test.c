@@ -1737,17 +1737,23 @@ int main(int argc, char **argv)
 	if (opts.o_probe_secinfo)
 		return probe_secinfo(&opts);
 
-	/* --threads N: each worker establishes its own GSS context concurrently. */
-	if (opts.o_threads >= 1)
-		return krb5_run_threads(&opts);
-
-	/* Build default principal "nfs@HOST" if not specified */
+	/*
+	 * Build default principal "nfs@HOST" if not specified.  Must happen
+	 * before any mode dispatch (--threads, --probe-secinfo, etc.) that
+	 * calls into krb5_establish_context, otherwise those paths reach
+	 * strlen(opts->o_principal) with opts.o_principal == NULL.  The
+	 * storage has main()-scope so it outlives all dispatched modes.
+	 */
 	char default_principal[512];
 	if (!opts.o_principal) {
 		snprintf(default_principal, sizeof(default_principal), "nfs@%s",
 			 opts.o_host);
 		opts.o_principal = default_principal;
 	}
+
+	/* --threads N: each worker establishes its own GSS context concurrently. */
+	if (opts.o_threads >= 1)
+		return krb5_run_threads(&opts);
 
 	const char *sec_label = (opts.o_sec == RPCSEC_GSS_SVC_NONE)  ? "krb5" :
 				(opts.o_sec == RPCSEC_GSS_SVC_INTEG) ? "krb5i" :
