@@ -668,15 +668,20 @@ void tls_conn_close(struct tls_conn *conn)
 
 size_t tls_conn_get_alpn(const struct tls_conn *conn, char *buf, size_t bufsz)
 {
+	/*
+	 * Contract: on every return path, buf (if non-NULL and bufsz > 0) is
+	 * a valid NUL-terminated C string.  Callers that strcmp the buffer
+	 * without checking the return value are then safe even on failure.
+	 */
+	if (buf && bufsz > 0)
+		buf[0] = '\0';
 	if (!conn || !conn->tc_ssl || !buf || bufsz == 0)
 		return 0;
 	const uint8_t *proto = NULL;
 	unsigned int proto_len = 0;
 	SSL_get0_alpn_selected(conn->tc_ssl, &proto, &proto_len);
-	if (!proto || proto_len == 0) {
-		buf[0] = '\0';
+	if (!proto || proto_len == 0)
 		return 0;
-	}
 	size_t copy = (proto_len < bufsz - 1) ? proto_len : bufsz - 1;
 	memcpy(buf, proto, copy);
 	buf[copy] = '\0';

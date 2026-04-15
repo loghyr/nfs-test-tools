@@ -7,7 +7,10 @@
  *   1. TCP connect to the server.
  *   2. Send a NULL RPC call with AUTH_TLS (flavor 7) credential.
  *   3. Verify the server returns an RPC_SUCCESS reply.
- *   4. Perform TLS handshake; negotiate ALPN "sunrpc".
+ *   4. Perform TLS handshake.  ALPN "sunrpc" is offered to the server
+ *      but not required by default, since Linux knfsd + tlshd do not
+ *      advertise it.  nfs_tls_test --require-alpn sunrpc enforces the
+ *      RFC 9289 §4.1 MUST when the caller needs conformance.
  *   5. Optionally send post-TLS NULL RPC calls to confirm the session works.
  */
 
@@ -128,7 +131,10 @@ tls_probe_only(const char *host, const char *port, uint32_t xid, char *errbuf,
  * tls_connect_starttls -- connect to host:port, perform RFC 9289 STARTTLS.
  *
  * Sends a NULL RPC call with AUTH_TLS credential, reads the reply, then
- * upgrades the connection with SSL_connect().  Verifies ALPN = "sunrpc".
+ * upgrades the connection with SSL_connect().  The "sunrpc" ALPN protocol
+ * is offered but the server's selection is not enforced here; use
+ * tls_conn_get_alpn (or nfs_tls_test --require-alpn) to enforce a specific
+ * protocol after the handshake.
  *
  * host       : hostname or IP address string
  * port       : port number string (e.g. "2049")

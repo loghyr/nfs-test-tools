@@ -38,7 +38,9 @@ connection goes through four phases:
 1. **TCP connect** to the server on the NFS port
 2. **AUTH_TLS probe** -- sends a special NULL RPC with the AUTH_TLS
    credential (flavor 7) to ask the server to begin TLS negotiation
-3. **TLS handshake** with ALPN "sunrpc" (required by RFC 9289)
+3. **TLS handshake**; ALPN "sunrpc" is offered but not enforced by
+   default (Linux knfsd + tlshd do not advertise it).  Pass
+   `--require-alpn sunrpc` to enforce the RFC 9289 §4.1 MUST.
 4. **NFS NULL RPC** over the encrypted channel to confirm the
    encrypted channel works end-to-end
 
@@ -68,7 +70,8 @@ The server must:
 1. Support RFC 9289 STARTTLS (not raw TLS on a separate port)
 2. Have a valid TLS certificate
 3. Configure TLS 1.3 (the tool enforces TLS 1.3 minimum)
-4. Negotiate ALPN protocol "sunrpc"
+4. Negotiate ALPN protocol "sunrpc" (RFC 9289 MUST; in practice many
+   Linux deployments do not advertise it -- see `--require-alpn`)
 
 #### Linux knfsd setup (reference)
 
@@ -127,7 +130,9 @@ connectivity check:
 
 This verifies:
 - The server responds to AUTH_TLS probe (RFC 9289 support)
-- TLS handshake succeeds with ALPN "sunrpc"
+- TLS handshake succeeds (ALPN "sunrpc" offered but not enforced;
+  add `--require-alpn sunrpc` to fail the run if the server does not
+  select it)
 - TLS 1.3 is negotiated
 - A NULL RPC works over the encrypted channel
 
@@ -248,9 +253,10 @@ failure that latency-only monitoring would miss.
 ```
 
 Promotes any TLS version below 1.3 from a WARN to a hard FAIL, and
-requires a specific ALPN protocol (default check is already
-`sunrpc` per RFC 9289; this lets you enforce arbitrary protocols
-for non-NFS testing).
+enforces the named ALPN protocol.  There is no default ALPN
+enforcement -- pass `--require-alpn sunrpc` explicitly to verify
+the RFC 9289 §4.1 MUST, or pass a different protocol for non-NFS
+testing.
 
 #### JSON output for CI integration
 
