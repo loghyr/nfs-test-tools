@@ -334,27 +334,32 @@ int parse_data_reply_verifier(const uint8_t *body, size_t body_len,
 
 	/*
 	 * Reply header verifier: gss_verify_mic over 4 big-endian seq_num
-	 * bytes.  This is identical for SVC_NONE / SVC_INTEG / SVC_PRIV --
-	 * the service flavor changes only the procedure body, not the
-	 * RPCSEC_GSS reply verifier.
+	 * bytes.  RFC 2203 §5.3.1-5.3.3 require this verifier for every
+	 * RPCSEC_GSS DATA reply regardless of service flavor (SVC_NONE,
+	 * SVC_INTEG, SVC_PRIV).  Reject any reply whose verifier flavor is
+	 * not RPCSEC_GSS or whose verifier body is empty -- either would
+	 * let an unauthenticated reply be accepted under a GSS session.
 	 */
-	if (verf_flavor == RPCSEC_GSS && verf_len > 0) {
-		if (pos + verf_len > body_len) {
-			snprintf(errbuf, errsz,
-				 "DATA reply: verifier body truncated");
-			return -1;
-		}
+	if (verf_flavor != RPCSEC_GSS) {
+		snprintf(errbuf, errsz,
+			 "DATA reply: verifier flavor %u (expected RPCSEC_GSS=%u)",
+			 verf_flavor, RPCSEC_GSS);
+		return -1;
+	}
+	if (verf_len == 0) {
+		snprintf(errbuf, errsz,
+			 "DATA reply: RPCSEC_GSS verifier is empty "
+			 "(RFC 2203 §5.3 requires a MIC)");
+		return -1;
+	}
+	if (pos + verf_len > body_len) {
+		snprintf(errbuf, errsz, "DATA reply: verifier body truncated");
+		return -1;
+	}
+	{
 		gss_buffer_desc mic_buf;
 		mic_buf.value = (void *)(body + pos);
 		mic_buf.length = verf_len;
-
-		/* Debug: dump raw MIC token bytes */
-		fprintf(stderr, "DEBUG reply MIC (%u bytes, seq_num=%u):",
-			verf_len, gc->gc_seq_num);
-		for (uint32_t di = 0; di < verf_len; di++)
-			fprintf(stderr, " %02x",
-				((const uint8_t *)mic_buf.value)[di]);
-		fprintf(stderr, "\n");
 
 		uint8_t seq_buf[4];
 		size_t sq = 0;

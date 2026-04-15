@@ -19,9 +19,12 @@
  *  13.  Trailing junk after wrapped token (SVC_PRIV, RFC 2203 S5.3.3)
  *
  * Mock injection:
- *   All tests set verf_len=0 in the reply so the header gss_verify_mic call
- *   is skipped; mock pointers control only the body verification path.
- *   gc.gc_ctx = GSS_C_NO_CONTEXT throughout; mocks ignore the ctx argument.
+ *   The header verifier is mandatory (RFC 2203 §5.3); tests install
+ *   mock_verify_ok on gc.gc_verify_mic so the header MIC check passes
+ *   with dummy bytes.  Body verification uses its own mock pointer where
+ *   the test needs distinct behavior (e.g. mock_unwrap_noconf, the
+ *   two-phase mock_verify_first_ok_then_bad).  gc.gc_ctx = GSS_C_NO_CONTEXT
+ *   throughout; mocks ignore the ctx argument.
  */
 
 #include <stdio.h>
@@ -136,6 +139,29 @@ static OM_uint32 mock_verify_badsig(OM_uint32 *min_stat,
 }
 
 /*
+ * mock_verify_first_ok_then_bad -- returns GSS_S_COMPLETE on the first call
+ * and GSS_S_BAD_SIG on every subsequent call.  Used to test body-MIC
+ * rejection without also failing the header-MIC check, now that the
+ * header verifier is mandatory (RFC 2203 §5.3).  Reset g_mock_verify_calls
+ * to 0 before each test that uses this mock.
+ */
+static int g_mock_verify_calls = 0;
+
+static OM_uint32 mock_verify_first_ok_then_bad(
+	OM_uint32 *min_stat, gss_ctx_id_t ctx __attribute__((unused)),
+	gss_buffer_t msg __attribute__((unused)),
+	gss_buffer_t mic __attribute__((unused)),
+	gss_qop_t *qop)
+{
+	*min_stat = 0;
+	if (qop)
+		*qop = 0;
+	if (g_mock_verify_calls++ == 0)
+		return GSS_S_COMPLETE;
+	return GSS_S_BAD_SIG;
+}
+
+/*
  * g_mock_unwrap_seq -- seq_num that mock_unwrap_ok places in the plain buffer.
  * Set before each priv-path test.
  */
@@ -222,10 +248,11 @@ static void test_gc_init(struct gss_ctx *gc, uint32_t seq_num)
 static int test_svc_none_valid(void)
 {
 	uint8_t buf[256];
-	size_t body_len = build_reply_header(buf, sizeof(buf), 0x1234u, 0);
+	size_t body_len = build_reply_header(buf, sizeof(buf), 0x1234u, 4);
 
 	struct gss_ctx gc;
 	test_gc_init(&gc, 1u);
+	gc.gc_verify_mic = mock_verify_ok;
 
 	char errbuf[256] = { 0 };
 	int rc = parse_data_reply_verifier(buf, body_len, 0x1234u, &gc,
@@ -246,7 +273,7 @@ static int test_svc_integ_valid(void)
 {
 	uint8_t buf[256];
 	uint32_t seq = 42u;
-	size_t pos = build_reply_header(buf, sizeof(buf), 0xABCDu, 0);
+	size_t pos = build_reply_header(buf, sizeof(buf), 0xABCDu, 4);
 
 	uint8_t inner[4] = {
 		(uint8_t)((seq >> 24) & 0xff),
@@ -282,7 +309,7 @@ static int test_svc_priv_valid(void)
 {
 	uint8_t buf[256];
 	uint32_t seq = 42u;
-	size_t pos = build_reply_header(buf, sizeof(buf), 0xDEADu, 0);
+	size_t pos = build_reply_header(buf, sizeof(buf), 0xDEADu, 4);
 
 	uint8_t wrapped[8] = { 0x55, 0x66, 0x77, 0x88, 0x99, 0xAA, 0xBB, 0xCC };
 	put_opaque(buf, &pos, wrapped, sizeof(wrapped));
@@ -291,6 +318,7 @@ static int test_svc_priv_valid(void)
 
 	struct gss_ctx gc;
 	test_gc_init(&gc, seq);
+	gc.gc_verify_mic = mock_verify_ok;
 	gc.gc_unwrap = mock_unwrap_ok;
 	gc.gc_release_buffer = mock_release_free;
 
@@ -312,7 +340,7 @@ static int test_svc_priv_valid(void)
 static int test_integ_truncated_inner_len(void)
 {
 	uint8_t buf[256];
-	size_t pos = build_reply_header(buf, sizeof(buf), 0x0001u, 0);
+	size_t pos = build_reply_header(buf, sizeof(buf), 0x0001u, 4);
 	buf[pos++] = 0x00;
 	buf[pos++] = 0x00; /* 2 bytes -- not a complete uint32 */
 
@@ -342,7 +370,7 @@ static int test_integ_truncated_checksum(void)
 {
 	uint8_t buf[256];
 	uint32_t seq = 1u;
-	size_t pos = build_reply_header(buf, sizeof(buf), 0x0002u, 0);
+	size_t pos = build_reply_header(buf, sizeof(buf), 0x0002u, 4);
 
 	uint8_t inner[4] = { 0, 0, 0, (uint8_t)seq };
 	put_opaque(buf, &pos, inner, 4);
@@ -375,7 +403,7 @@ static int test_integ_wrong_seq(void)
 	uint8_t buf[256];
 	uint32_t gc_seq = 42u;
 	uint32_t inner_seq = 99u; /* deliberate mismatch */
-	size_t pos = build_reply_header(buf, sizeof(buf), 0x0003u, 0);
+	size_t pos = build_reply_header(buf, sizeof(buf), 0x0003u, 4);
 
 	uint8_t inner[4] = {
 		(uint8_t)((inner_seq >> 24) & 0xff),
@@ -416,7 +444,7 @@ static int test_integ_bad_mic(void)
 {
 	uint8_t buf[256];
 	uint32_t seq = 42u;
-	size_t pos = build_reply_header(buf, sizeof(buf), 0x0004u, 0);
+	size_t pos = build_reply_header(buf, sizeof(buf), 0x0004u, 4);
 
 	uint8_t inner[4] = {
 		(uint8_t)((seq >> 24) & 0xff),
@@ -430,7 +458,9 @@ static int test_integ_bad_mic(void)
 
 	struct gss_ctx gc;
 	test_gc_init(&gc, seq);
-	gc.gc_verify_mic = mock_verify_badsig;
+	/* Header MIC must pass; body MIC must fail.  Two-phase mock. */
+	g_mock_verify_calls = 0;
+	gc.gc_verify_mic = mock_verify_first_ok_then_bad;
 
 	char errbuf[256] = { 0 };
 	int rc = parse_data_reply_verifier(buf, pos, 0x0004u, &gc,
@@ -457,13 +487,14 @@ static int test_integ_bad_mic(void)
 static int test_priv_no_conf(void)
 {
 	uint8_t buf[256];
-	size_t pos = build_reply_header(buf, sizeof(buf), 0x0005u, 0);
+	size_t pos = build_reply_header(buf, sizeof(buf), 0x0005u, 4);
 
 	uint8_t wrapped[4] = { 0x01, 0x02, 0x03, 0x04 };
 	put_opaque(buf, &pos, wrapped, sizeof(wrapped));
 
 	struct gss_ctx gc;
 	test_gc_init(&gc, 1u);
+	gc.gc_verify_mic = mock_verify_ok;
 	gc.gc_unwrap = mock_unwrap_noconf;
 	gc.gc_release_buffer = mock_release_free;
 
@@ -494,7 +525,7 @@ static int test_integ_trailing_junk(void)
 {
 	uint8_t buf[256];
 	uint32_t seq = 7u;
-	size_t pos = build_reply_header(buf, sizeof(buf), 0x0006u, 0);
+	size_t pos = build_reply_header(buf, sizeof(buf), 0x0006u, 4);
 
 	uint8_t inner[4] = { 0, 0, 0, (uint8_t)seq };
 	uint8_t mic[4] = { 0xAA, 0xBB, 0xCC, 0xDD };
@@ -535,7 +566,7 @@ static int test_integ_trailing_junk(void)
 static int test_integ_empty_body(void)
 {
 	uint8_t buf[256];
-	size_t body_len = build_reply_header(buf, sizeof(buf), 0x0007u, 0);
+	size_t body_len = build_reply_header(buf, sizeof(buf), 0x0007u, 4);
 	/* no body follows */
 
 	struct gss_ctx gc;
@@ -567,7 +598,7 @@ static int test_integ_empty_body(void)
 static int test_wrong_xid(void)
 {
 	uint8_t buf[256];
-	size_t body_len = build_reply_header(buf, sizeof(buf), 0x1111u, 0);
+	size_t body_len = build_reply_header(buf, sizeof(buf), 0x1111u, 4);
 
 	struct gss_ctx gc;
 	test_gc_init(&gc, 1u);
@@ -631,7 +662,7 @@ static int test_denied_reply(void)
 static int test_priv_trailing_junk(void)
 {
 	uint8_t buf[512];
-	size_t body_len = build_reply_header(buf, sizeof(buf), 0x000Bu, 0);
+	size_t body_len = build_reply_header(buf, sizeof(buf), 0x000Bu, 4);
 
 	/* databody_priv opaque: seq_num (4 bytes) wrapped as opaque */
 	uint8_t plain[4];
@@ -645,6 +676,7 @@ static int test_priv_trailing_junk(void)
 
 	struct gss_ctx gc;
 	test_gc_init(&gc, 1u);
+	gc.gc_verify_mic = mock_verify_ok;
 	gc.gc_unwrap = mock_unwrap_ok;
 	gc.gc_release_buffer = mock_release_free;
 	g_mock_unwrap_seq = 1u;
@@ -658,6 +690,76 @@ static int test_priv_trailing_junk(void)
 		return -1;
 	}
 	if (!strstr(errbuf, "trailing")) {
+		printf("  wrong error: %s\n", errbuf);
+		return -1;
+	}
+	return 0;
+}
+
+/* -----------------------------------------------------------------------
+ * test_reject_auth_none_verifier
+ *
+ * RFC 2203 §5.3: DATA replies under RPCSEC_GSS must carry an
+ * RPCSEC_GSS verifier.  A reply that arrives with verf_flavor=AUTH_NONE
+ * must be rejected regardless of whether the rest of the frame parses.
+ * --------------------------------------------------------------------- */
+
+static int test_reject_auth_none_verifier(void)
+{
+	uint8_t buf[256];
+	size_t pos = 0;
+	put_u32(buf, &pos, 0x2000u); /* xid */
+	put_u32(buf, &pos, RPC_REPLY);
+	put_u32(buf, &pos, RPC_MSG_ACCEPTED);
+	put_u32(buf, &pos, RPC_AUTH_NONE); /* verf_flavor = 0 (WRONG) */
+	put_u32(buf, &pos, 0u); /* verf_len = 0 */
+	put_u32(buf, &pos, RPC_SUCCESS); /* accept_stat = 0 */
+
+	struct gss_ctx gc;
+	test_gc_init(&gc, 1u);
+	gc.gc_verify_mic = mock_verify_ok;
+
+	char errbuf[256] = { 0 };
+	int rc = parse_data_reply_verifier(buf, pos, 0x2000u, &gc,
+					   RPCSEC_GSS_SVC_NONE, errbuf,
+					   sizeof(errbuf));
+	if (rc == 0) {
+		printf("  expected failure but got success\n");
+		return -1;
+	}
+	if (!strstr(errbuf, "flavor")) {
+		printf("  wrong error: %s\n", errbuf);
+		return -1;
+	}
+	return 0;
+}
+
+/* -----------------------------------------------------------------------
+ * test_reject_zero_verf_len
+ *
+ * RFC 2203 §5.3: the RPCSEC_GSS verifier on a DATA reply must carry a
+ * MIC.  A reply with verf_flavor=RPCSEC_GSS but verf_len=0 bypasses
+ * gss_verify_mic entirely and must be rejected.
+ * --------------------------------------------------------------------- */
+
+static int test_reject_zero_verf_len(void)
+{
+	uint8_t buf[256];
+	size_t body_len = build_reply_header(buf, sizeof(buf), 0x2001u, 0);
+
+	struct gss_ctx gc;
+	test_gc_init(&gc, 1u);
+	gc.gc_verify_mic = mock_verify_ok;
+
+	char errbuf[256] = { 0 };
+	int rc = parse_data_reply_verifier(buf, body_len, 0x2001u, &gc,
+					   RPCSEC_GSS_SVC_NONE, errbuf,
+					   sizeof(errbuf));
+	if (rc == 0) {
+		printf("  expected failure but got success\n");
+		return -1;
+	}
+	if (!strstr(errbuf, "empty") && !strstr(errbuf, "MIC")) {
 		printf("  wrong error: %s\n", errbuf);
 		return -1;
 	}
@@ -683,6 +785,8 @@ int main(void)
 	RUN_TEST(test_wrong_xid);
 	RUN_TEST(test_denied_reply);
 	RUN_TEST(test_priv_trailing_junk);
+	RUN_TEST(test_reject_auth_none_verifier);
+	RUN_TEST(test_reject_zero_verf_len);
 
 	printf("\n%d passed, %d failed\n", g_pass, g_fail);
 	return g_fail ? 1 : 0;
