@@ -285,7 +285,7 @@ static int recv_starttls_reply(int fd, uint32_t expected_xid, char *errbuf,
 		return -1;
 	}
 	/* Skip verf body, padded to 4-byte alignment */
-	uint32_t verf_padded = (verf_len + 3u) & ~3u;
+	size_t verf_padded = ((size_t)verf_len + 3u) & ~(size_t)3u;
 	if (!rpc_skip(body_len, &pos, verf_padded)) {
 		snprintf(errbuf, errsz,
 			 "STARTTLS reply: verifier body truncated (len=%u)",
@@ -604,7 +604,7 @@ int tls_send_nfs_null(struct tls_conn *conn, uint32_t xid, char *errbuf,
 		snprintf(errbuf, errsz, "NULL reply: short header");
 		return -1;
 	}
-	uint32_t verf_padded = (verf_len + 3u) & ~3u;
+	size_t verf_padded = ((size_t)verf_len + 3u) & ~(size_t)3u;
 	if (!rpc_skip(body_len, &pos, verf_padded) ||
 	    !rpc_get_u32(body, body_len, &pos, &accept_stat)) {
 		snprintf(errbuf, errsz, "NULL reply: truncated body");

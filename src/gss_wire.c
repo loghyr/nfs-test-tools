@@ -95,8 +95,8 @@ size_t build_gss_data_null(uint8_t *buf, size_t bufsz, uint32_t xid,
 {
 	gc->gc_seq_num++;
 
-	uint32_t handle_padded = (gc->gc_handle_len + 3u) & ~3u;
-	uint32_t cred_body_len = 4 + 4 + 4 + 4 + 4 + handle_padded;
+	size_t handle_padded = ((size_t)gc->gc_handle_len + 3u) & ~(size_t)3u;
+	uint32_t cred_body_len = (uint32_t)(4 + 4 + 4 + 4 + 4 + handle_padded);
 
 	size_t pos = 0;
 	size_t marker_pos = pos;
@@ -384,7 +384,7 @@ int parse_data_reply_verifier(const uint8_t *body, size_t body_len,
 		}
 	}
 
-	uint32_t verf_padded = (verf_len + 3u) & ~3u;
+	size_t verf_padded = ((size_t)verf_len + 3u) & ~(size_t)3u;
 	if (!rpc_skip(body_len, &pos, verf_padded)) {
 		snprintf(errbuf, errsz, "DATA reply: verifier skip failed");
 		return -1;
@@ -428,7 +428,7 @@ int parse_data_reply_verifier(const uint8_t *body, size_t body_len,
 			return -1;
 		}
 		const uint8_t *inner_p = body + pos;
-		uint32_t inner_padded = (inner_len + 3u) & ~3u;
+		size_t inner_padded = ((size_t)inner_len + 3u) & ~(size_t)3u;
 		if (!rpc_skip(body_len, &pos, inner_padded)) {
 			snprintf(errbuf, errsz,
 				 "krb5i reply: databody padding short");
@@ -465,7 +465,7 @@ int parse_data_reply_verifier(const uint8_t *body, size_t body_len,
 		/* RFC 2203 S5.3.2: after the checksum there must be no
 		 * further data.  A noncompliant server appending trailing
 		 * bytes would otherwise pass silently. */
-		uint32_t mic_padded = (mic_len + 3u) & ~3u;
+		size_t mic_padded = ((size_t)mic_len + 3u) & ~(size_t)3u;
 		size_t expected_end = pos + mic_padded;
 		if (expected_end != body_len) {
 			snprintf(errbuf, errsz,
@@ -521,7 +521,7 @@ int parse_data_reply_verifier(const uint8_t *body, size_t body_len,
 		/* RFC 2203 S5.3.3: after the wrapped token there must be no
 		 * further data.  A noncompliant server appending trailing
 		 * bytes would otherwise pass silently. */
-		uint32_t wrapped_padded = (wrapped_len + 3u) & ~3u;
+		size_t wrapped_padded = ((size_t)wrapped_len + 3u) & ~(size_t)3u;
 		if (pos + wrapped_padded != body_len) {
 			snprintf(errbuf, errsz,
 				 "krb5p reply: %zu trailing byte%s after "
