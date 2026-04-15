@@ -1281,6 +1281,38 @@ static int krb5_establish_context(const struct options *opts,
 
 	/* Server may send a completion token on the final round; free it. */
 	free(in_token.value);
+
+	/*
+	 * Verify the saved INIT reply verifier (RFC 2203 §5.2.2.1).
+	 *
+	 * The server's first gss_get_mic call is over htonl(seq_window), which
+	 * advances the acceptor's internal sequence counter.  We must call
+	 * gss_verify_mic on that token to catch up; otherwise our counter is
+	 * behind by one and the first DATA reply verifier (the server's second
+	 * gss_get_mic) appears out-of-sequence, producing GSS_S_BAD_MIC or
+	 * GSS_S_GAP_TOKEN on the first DATA call.  Both the single-threaded
+	 * path and every krb5_worker_thread depend on this, so the catch-up
+	 * must happen in this shared helper rather than in the caller.
+	 */
+	if (gc->gc_init_verf_len > 0) {
+		uint32_t window_net = htonl(gc->gc_init_seq_window);
+		gss_buffer_desc msg_buf  = { .value  = &window_net,
+					     .length = 4 };
+		gss_buffer_desc verf_buf = { .value  = gc->gc_init_verf,
+					     .length = gc->gc_init_verf_len };
+		OM_uint32 qop_state;
+		maj_stat = gss_verify_mic(&min_stat, gc->gc_ctx, &msg_buf,
+					  &verf_buf, &qop_state);
+		if (verbose)
+			printf("  INIT verifier verify: maj=0x%x min=0x%x\n",
+			       maj_stat, min_stat);
+		if (maj_stat != GSS_S_COMPLETE)
+			fprintf(stderr,
+				"WARNING: INIT reply verifier check failed: "
+				"maj=0x%x min=0x%x (continuing)\n",
+				maj_stat, min_stat);
+	}
+
 	*fd_out = fd;
 	return NFS_ERR_OK;
 }
@@ -1914,14 +1946,19 @@ int main(int argc, char **argv)
 	       gc.gc_handle_len);
 
 	/*
-	 * Verify the saved INIT reply verifier (RFC 2203 S5.2.2.1).
+	 * Verify the saved INIT reply verifier (RFC 2203 §5.2.2.1).
 	 *
-	 * The server's first gss_get_mic call is over htonl(seq_window),
-	 * which advances the acceptor's internal sequence counter.  We must
-	 * call gss_verify_mic on that token to catch up; otherwise our
-	 * counter is behind by one and the DATA reply verifier (the server's
-	 * second gss_get_mic) appears out-of-sequence, producing
-	 * GSS_S_BAD_MIC or GSS_S_GAP_TOKEN on the first DATA call.
+	 * The server's first gss_get_mic call is over htonl(seq_window), which
+	 * advances the acceptor's internal sequence counter.  We must call
+	 * gss_verify_mic on that token to catch up; otherwise our counter is
+	 * behind by one and the DATA reply verifier (the server's second
+	 * gss_get_mic) appears out-of-sequence, producing GSS_S_BAD_MIC or
+	 * GSS_S_GAP_TOKEN on the first DATA call.
+	 *
+	 * The single-threaded path open-codes context establishment above, so
+	 * the catch-up lives here.  krb5_establish_context (used by worker
+	 * threads) runs the same catch-up internally before returning success
+	 * -- keep the two paths in lockstep if either is edited.
 	 */
 	if (gc.gc_init_verf_len > 0) {
 		uint32_t window_net = htonl(gc.gc_init_seq_window);
