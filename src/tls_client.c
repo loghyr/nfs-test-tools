@@ -87,38 +87,66 @@ static double now_ms(void)
 /* --- internal helpers --- */
 
 /*
- * ssl_readn -- read exactly n bytes from ssl, retrying on EINTR.
- * Returns n on success, 0 on EOF, -1 on error.
+ * SSL_ERROR_WANT_READ / SSL_ERROR_WANT_WRITE can appear on blocking
+ * sockets when the session renegotiates under TLS 1.3 key update, and
+ * on any future non-blocking BIO configuration.  Retrying up to a cap
+ * is the documented contract: OpenSSL expects the caller to invoke
+ * SSL_read/SSL_write again with the same arguments.  The cap prevents
+ * livelock if a buggy peer loops in WANT_* forever.
+ */
+#define SSL_WANT_RETRY_MAX 1024
+
+/*
+ * ssl_readn -- read exactly n bytes from ssl, retrying on EINTR and
+ * SSL_ERROR_WANT_*.  Returns n on success, 0 on clean EOF, -1 on error.
  */
 static ssize_t ssl_readn(SSL *ssl, void *buf, size_t n)
 {
 	size_t got = 0;
 	uint8_t *p = (uint8_t *)buf;
+	int want_retries = 0;
 	while (got < n) {
 		int r = SSL_read(ssl, p + got, (int)(n - got));
 		if (r <= 0) {
 			int err = SSL_get_error(ssl, r);
 			if (err == SSL_ERROR_ZERO_RETURN)
 				return 0; /* clean EOF */
+			if (err == SSL_ERROR_WANT_READ ||
+			    err == SSL_ERROR_WANT_WRITE) {
+				if (++want_retries > SSL_WANT_RETRY_MAX)
+					return -1;
+				continue;
+			}
 			return -1;
 		}
+		want_retries = 0;
 		got += (size_t)r;
 	}
 	return (ssize_t)n;
 }
 
 /*
- * ssl_writen -- write exactly n bytes to ssl.
+ * ssl_writen -- write exactly n bytes to ssl, retrying on SSL_ERROR_WANT_*.
  * Returns n on success, -1 on error.
  */
 static ssize_t ssl_writen(SSL *ssl, const void *buf, size_t n)
 {
 	size_t sent = 0;
 	const uint8_t *p = (const uint8_t *)buf;
+	int want_retries = 0;
 	while (sent < n) {
 		int r = SSL_write(ssl, p + sent, (int)(n - sent));
-		if (r <= 0)
+		if (r <= 0) {
+			int err = SSL_get_error(ssl, r);
+			if (err == SSL_ERROR_WANT_READ ||
+			    err == SSL_ERROR_WANT_WRITE) {
+				if (++want_retries > SSL_WANT_RETRY_MAX)
+					return -1;
+				continue;
+			}
 			return -1;
+		}
+		want_retries = 0;
 		sent += (size_t)r;
 	}
 	return (ssize_t)n;
