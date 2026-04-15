@@ -193,11 +193,14 @@ static int read_rpc_record_ssl(SSL *ssl, uint8_t *body, size_t bodysz,
 }
 
 /*
- * Parse an RPC call header.  Sets *xid_out, *cred_flavor_out.  Returns
- * 1 on success, 0 if the body is malformed.
+ * Parse an RPC call header.  Sets *xid_out, *prog_out, *vers_out,
+ * *proc_out, *cred_flavor_out.  Returns 1 on success, 0 if the body is
+ * malformed.
  */
 static int parse_rpc_call(const uint8_t *body, size_t body_len,
-			  uint32_t *xid_out, uint32_t *cred_flavor_out)
+			  uint32_t *xid_out, uint32_t *prog_out,
+			  uint32_t *vers_out, uint32_t *proc_out,
+			  uint32_t *cred_flavor_out)
 {
 	size_t pos = 0;
 	uint32_t xid, msg_type, rpcvers, prog, vers, proc;
@@ -226,6 +229,9 @@ static int parse_rpc_call(const uint8_t *body, size_t body_len,
 		return 0;
 
 	*xid_out = xid;
+	*prog_out = prog;
+	*vers_out = vers;
+	*proc_out = proc;
 	*cred_flavor_out = cred_flavor;
 	return 1;
 }
@@ -343,8 +349,9 @@ static void handle_one(int cfd, SSL_CTX *ctx, struct conn_stats *stats,
 		return;
 	}
 
-	uint32_t xid, cred_flavor;
-	if (!parse_rpc_call(body, body_len, &xid, &cred_flavor)) {
+	uint32_t xid, prog, vers, proc, cred_flavor;
+	if (!parse_rpc_call(body, body_len, &xid, &prog, &vers, &proc,
+			    &cred_flavor)) {
 		if (stats->verbose)
 			printf("  STARTTLS: malformed call\n");
 		stats->fail_starttls++;
@@ -356,6 +363,23 @@ static void handle_one(int cfd, SSL_CTX *ctx, struct conn_stats *stats,
 			printf("  STARTTLS: cred flavor %u (not AUTH_TLS=7)\n",
 			       cred_flavor);
 		/* Still send a reply, just to be polite */
+		stats->fail_starttls++;
+		return;
+	}
+
+	/*
+	 * RFC 9289 §4.1: the STARTTLS probe is an NFS NULL call with
+	 * AUTH_TLS.  Any other prog/vers/proc is not a valid probe even if
+	 * the credential flavor is correct, and accepting it would let a
+	 * conformance test pass for a malformed client.
+	 */
+	if (prog != NFS_PROGRAM || vers != NFS_VERSION_4 ||
+	    proc != NFS_PROC_NULL) {
+		if (stats->verbose)
+			printf("  STARTTLS: not NFSv4 NULL "
+			       "(prog=%u vers=%u proc=%u; expected %u/%u/%u)\n",
+			       prog, vers, proc,
+			       NFS_PROGRAM, NFS_VERSION_4, NFS_PROC_NULL);
 		stats->fail_starttls++;
 		return;
 	}
