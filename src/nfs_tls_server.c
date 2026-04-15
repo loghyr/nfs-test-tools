@@ -457,10 +457,21 @@ static void handle_one(int cfd, SSL_CTX *ctx, struct conn_stats *stats,
 		if (rc <= 0)
 			break;
 
-		uint32_t rxid, rcred;
-		if (!parse_rpc_call(body, body_len, &rxid, &rcred)) {
+		uint32_t rxid, rprog, rvers, rproc, rcred;
+		if (!parse_rpc_call(body, body_len, &rxid, &rprog, &rvers,
+				    &rproc, &rcred)) {
 			if (stats->verbose)
 				printf("  malformed call over TLS\n");
+			break;
+		}
+		/* Post-TLS loop: accept only NFSv4 NULL calls, mirroring the
+		 * STARTTLS gate.  Drop anything else with a note. */
+		if (rprog != NFS_PROGRAM || rvers != NFS_VERSION_4 ||
+		    rproc != NFS_PROC_NULL) {
+			if (stats->verbose)
+				printf("  post-TLS call not NFSv4 NULL "
+				       "(prog=%u vers=%u proc=%u); dropping\n",
+				       rprog, rvers, rproc);
 			break;
 		}
 
