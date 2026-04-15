@@ -1067,7 +1067,17 @@ int main(int argc, char **argv)
 
 	int nworkers = o.o_threads;
 
-	/* Per-worker sample capacity */
+	/*
+	 * Per-worker sample capacity.  struct sample is ~48 bytes, so each
+	 * worker's sample array costs iter_per_worker * 48 bytes of RAM,
+	 * pre-allocated at start-of-run.  The naive duration-mode estimate
+	 * (duration_sec * 10000 conn/s) produces ~1.7 GB per worker for a
+	 * one-hour run with --rate unspecified, which OOMs modest hosts.
+	 * Cap the per-worker capacity at 1,000,000 samples (~48 MB) and let
+	 * sa_overflow report any samples dropped past the cap.  Users who
+	 * want every sample at higher rates should throttle with --rate.
+	 */
+	enum { ITER_PER_WORKER_CAP = 1000000 };
 	size_t iter_per_worker;
 	if (o.o_duration > 0) {
 		/* Conservative: max 10000 conn/s for up to o_duration seconds */
@@ -1079,6 +1089,8 @@ int main(int argc, char **argv)
 		iter_per_worker =
 			(size_t)((o.o_iterations + nworkers - 1) / nworkers);
 	}
+	if (iter_per_worker > ITER_PER_WORKER_CAP)
+		iter_per_worker = ITER_PER_WORKER_CAP;
 
 	struct worker *workers = (struct worker *)calloc((size_t)nworkers,
 							 sizeof(struct worker));
