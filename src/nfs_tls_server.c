@@ -546,9 +546,20 @@ int main(int argc, char **argv)
 		case 'M':
 			require_mtls = 1;
 			break;
-		case 'm':
-			max_conns = atol(optarg);
+		case 'm': {
+			char *endp;
+			errno = 0;
+			long v = strtol(optarg, &endp, 10);
+			if (errno != 0 || *endp != '\0' || v < 0) {
+				fprintf(stderr,
+					"Error: --max-conns must be a "
+					"non-negative integer (got '%s')\n",
+					optarg);
+				usage(argv[0]);
+			}
+			max_conns = v;
 			break;
+		}
 		case 'v':
 			verbose = 1;
 			break;
@@ -562,9 +573,25 @@ int main(int argc, char **argv)
 	if (!cert || !key)
 		usage(argv[0]);
 
-	signal(SIGINT, on_sigint);
-	signal(SIGTERM, on_sigint);
-	signal(SIGPIPE, SIG_IGN);
+	/*
+	 * Install signal handlers via sigaction for portable semantics
+	 * (plain signal() is SysV on some platforms, BSD on others).
+	 * SIGPIPE is ignored so a peer disconnect mid-write surfaces as
+	 * an EPIPE errno rather than killing the process.
+	 */
+	struct sigaction sa_int;
+	memset(&sa_int, 0, sizeof(sa_int));
+	sa_int.sa_handler = on_sigint;
+	sigemptyset(&sa_int.sa_mask);
+	sa_int.sa_flags = SA_RESTART;
+	sigaction(SIGINT, &sa_int, NULL);
+	sigaction(SIGTERM, &sa_int, NULL);
+
+	struct sigaction sa_pipe;
+	memset(&sa_pipe, 0, sizeof(sa_pipe));
+	sa_pipe.sa_handler = SIG_IGN;
+	sigemptyset(&sa_pipe.sa_mask);
+	sigaction(SIGPIPE, &sa_pipe, NULL);
 
 	SSL_CTX *ctx = create_server_ctx(cert, key, ca_cert, require_mtls);
 	if (!ctx)
@@ -590,7 +617,10 @@ int main(int argc, char **argv)
 		return EXIT_FAILURE;
 	}
 	int one = 1;
-	setsockopt(lfd, SOL_SOCKET, SO_REUSEADDR, &one, sizeof(one));
+	if (setsockopt(lfd, SOL_SOCKET, SO_REUSEADDR, &one, sizeof(one)) < 0)
+		fprintf(stderr,
+			"warning: setsockopt(SO_REUSEADDR): %s (continuing)\n",
+			strerror(errno));
 
 	struct sockaddr_in addr;
 	memset(&addr, 0, sizeof(addr));
